@@ -1,0 +1,5 @@
+.venv
+*.json
+*.tar.gz
+*.wav
+*.pkl
