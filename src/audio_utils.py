@@ -14,7 +14,7 @@ def playAudio(
         sample_rate:int=16_000,
         show:bool=False
     ):
-    assert any([filepath, tensor is not None]), "provide either wav-path or a wav-tensor of shape 2"
+    assert any([filepath is not None, tensor is not None]), "provide either wav-path or a wav-tensor of shape 2"
     if text is not None:
         print("Prompt:", text, sep="\n")
     if filepath:

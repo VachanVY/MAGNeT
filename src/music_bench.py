@@ -30,6 +30,7 @@ def shuffle_preserve_order(a, b):
     a, b = zip(*combined)
     return a, b
 
+
 def split_ds(x, y, split_float:float):
     assert len(x) == len(y)
     train_len = int(split_float*len(x))
@@ -136,6 +137,3 @@ def ioPathTextDs(
             paths, texts = pickle.load(file)
     
         return split_ds(paths, texts, split_float=split_float)
-
-
-
