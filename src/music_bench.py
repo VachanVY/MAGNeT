@@ -9,6 +9,8 @@ import json
 
 
 #----------------------------------------------------------------------------------------------#
+MAX_SEC = 10
+QCODING_LEN = 750
 DATA_DIR = "data/MusicBench"
 URLS = [
     "https://huggingface.co/datasets/amaai-lab/MusicBench/resolve/main/MusicBench_train.json"
@@ -129,11 +131,17 @@ def ioPathTextDs(
                 obj=[paths, texts], file=file,
                 protocol=pickle.HIGHEST_PROTOCOL
             )
-        return
     else:
         # load dataset
-        print("Loaded dataset.")
+        print("Dataset is already present.")
         with open(save_path, "rb") as file:
             paths, texts = pickle.load(file)
-    
         return split_ds(paths, texts, split_float=split_float)
+    
+if __name__ == "__main__":
+    print("Downloading dataset...")
+    download_dataset()
+    print("Done!")
+
+    ioPathTextDs(AUDIO_TXT_PATH, batch_size=32, split_float=0.9)
+    print("Done!")

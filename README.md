@@ -34,8 +34,8 @@ from the masking scheduler, then, we mask and predict spans of input tokens cond
     * *Recall, the audio representation is composed of multi-stream sequences created by RVQ. In which, the first codebook encodes the coarse information of the signal while later codebooks encode the
     quantization error to refine the generation quality*
     * ***To handle that, Borsos et al. (2023b) proposed to predict tokens from codebook k given its preceding codebooks. During training, a codebook level $k$, is being uniformly sampled from $\{1, \ldots ,K\}$. Then, we mask and predict the tokens of thek-th codebook given previous levels via teacher forcing***
-    * At inference, we sequentially generate the token
-    streams, where each codebook is being generated conditioned on previously generated codebooks
+    * **At inference, we sequentially generate the token
+    streams, where each codebook is being generated conditioned on previously generated codebooks**
 
 ### Method
 * Following the approach presented in the previous section solely does not lead to high-quality audio generation
@@ -94,3 +94,7 @@ as model conditioning
 * RVQ algorithm
 
     ![alt text](images/image-12.png)
+
+### Classifier free Guidance
+* ![alt text](images/cfg1.png)
+  ![alt text](images/cfg2.png)
