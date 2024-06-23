@@ -31,12 +31,12 @@ Output: [100, 120, 20, 200, <predValue>, <predValue>, 1000, <predValue>]
 ```python
 >>> loss_mask = torch.tensor(
     [[True, True, False, False, False, True, True],
-        [False, True, True, False, False, False, True]]
+    [False, True, True, False, False, False, True]]
 ) # True values to be taken for loss, False values to be ignored
 
 >>> pad_mask = torch.tensor(
     [[True, True, True, False, False, False, False],
-        [True, True, True, True, True, False, False]]
+    [True, True, True, True, True, False, False]]
 )
 >>> loss_mask & pad_mask # take loss only on masked tokens (True value)
 tensor([[ True,  True, False, False, False, False, False],

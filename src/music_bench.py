@@ -34,7 +34,7 @@ def shuffle_preserve_order(a, b):
 
 
 def split_ds(x, y, split_float:float):
-    assert len(x) == len(y)
+    assert len(x) == len(y), f"len(x): {len(x)} and len(y): {len(y)}"
     train_len = int(split_float*len(x))
 
     x_train, y_train = x[:train_len], y[:train_len]
@@ -97,14 +97,20 @@ def download_dataset():
             shutil.move(src=fpath, dst=DATA_PATH)
         print(f"Moved files from {src_dir} to {DATA_PATH} so deleting {src_dir}")
         os.removedirs(src_dir)
+        return
+    print(
+        "Data already present, skipping downloading. If you want to redownload then delete data folder and run again.\n"
+    )
 
 
 def ioPathTextDs(
     save_path:str,
     batch_size:tp.Union[int, None]=None,
-    split_float:float = 0.9
+    split_float:float = 0.9,
+    return_ds:bool=False,
+    force_redo:bool=False
 ):
-    if not os.path.exists(save_path):
+    if not os.path.exists(save_path) or force_redo:
         print("Saving dataset...")
         assert batch_size is not None, "provide batch_size when saving."
         paths, texts = [], []
@@ -120,7 +126,6 @@ def ioPathTextDs(
                 wavpath = os.path.join(DATA_DIR, "datashare", wavpath)
                 paths.append(wavpath); texts.append(text)
         assert len(paths)==len(texts), "Number of audio paths must be equal to number of captions"
-        print("Loaded paths and prompts...")
         # shuffle dataset
         paths, texts = shuffle_preserve_order(paths, texts)
         paths = [list(islice(paths, i, i+batch_size)) for i in range(0, len(paths), batch_size)][:-1] # (len//batch_size, batch_size)
@@ -133,15 +138,32 @@ def ioPathTextDs(
             )
     else:
         # load dataset
-        print("Dataset is already present.")
         with open(save_path, "rb") as file:
             paths, texts = pickle.load(file)
+        if len(paths[0]) != batch_size:
+            print(f"Making dataset for batch_size: {batch_size} instead of `batch_size` in saved dataset.")
+            paths, texts = ioPathTextDs(
+                AUDIO_TXT_PATH, 
+                batch_size=batch_size, 
+                split_float=split_float,
+                return_ds=True,
+                force_redo=True
+            )
+        print("Dataset is preprocessed.")
+    if return_ds:
         return split_ds(paths, texts, split_float=split_float)
-    
+  
 if __name__ == "__main__":
-    print("Downloading dataset...")
-    download_dataset()
-    print("Done!")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--download', default=False, type=bool)
+    parser.add_argument('--preprocess', default=False, type=bool)
+    parser.add_argument('--batch_size', default=32, type=int)
+    args = parser.parse_args()
 
-    ioPathTextDs(AUDIO_TXT_PATH, batch_size=32, split_float=0.9)
-    print("Done!")
+    if args.download:
+        print("Request: --download")
+        download_dataset()
+    if args.preprocess:
+        print("Request: --preprocess")
+        ioPathTextDs(AUDIO_TXT_PATH, batch_size=args.batch_size, split_float=0.9)

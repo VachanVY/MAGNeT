@@ -8,8 +8,8 @@ from torch import (
     nn, Tensor
 )
 
-from music_bench import QCODING_LEN
-import utils.sample_tokens as sample_tokens
+from .music_bench import QCODING_LEN
+from .utils import sample_tokens
 
 @dc.dataclass
 class monfig: # model config
@@ -79,6 +79,7 @@ class MAGNET(nn.Module):
         model:nn.Module,
         config:monfig # Model config
     ):
+        super().__init__()
         self.maxlen = config.max_seq_len
         self.nq = config.num_codebooks # nq
         self.cardinality = config.cardinality
@@ -101,15 +102,15 @@ class MAGNET(nn.Module):
         self,
         x:Tensor, # (B, Nq, T)
         conditioning_tensor:tp.Optional[Tensor], # (B, N, cond_dim)
-        seq_mask:tp.Optional[Tensor]=None, # (B, T)
-        cross_att_mask:tp.Optional[Tensor]=None # (T, N)
+        # seq_mask:tp.Optional[Tensor]=None, # (B, T) # were doing this manually in the training loop...
+        # cross_att_mask:tp.Optional[Tensor]=None # (T, N)
     ):
         # emb: (cardinality {in dimension T}, d_model) ==x[:, codebook]: (B, T)=> (B, T, d_model)
         x = sum([self.embeddings[codebook](x[:, codebook]) for codebook in range(self.nq)]) # (B, T, d_model)
-        x = self.model(x, conditioning_tensor, seq_mask, cross_att_mask) # (B, T, d_model)
+        x = self.model(x, conditioning_tensor) #, seq_mask, cross_att_mask) # (B, T, d_model)
         # stack((B, T, cardinality), dim=1) => (B, nq, T, cardinality)
         x = torch.stack([self.linears[codebook](x) for codebook in range(self.nq)], dim=1)
-        return x
+        return x # (B, nq, T, cardinality)
     
     def configure_optimizers(
         self,
@@ -142,12 +143,7 @@ class MAGNET(nn.Module):
     
     @property
     def mask_id(self): return self.cardinality
-    
-    @staticmethod
-    @property
-    def spanlen():
-        return 3
-    
+       
     @torch.inference_mode()
     def generate(
         self,

@@ -12,20 +12,20 @@ import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 
-from music_bench import (
+from .music_bench import (
     shuffle_preserve_order,
     ioPathTextDs,
     AUDIO_TXT_PATH,
     QCODING_LEN,
     MAX_SEC
 )
-from preprocess_ops import PreProOps
-from model import (
+from .preprocess_ops import PreProOps
+from .model import (
     monfig,
     MAGNET,
     TransformerDecoder
 )
-from src.utils.lr_scheduler import CosineDecayWithWarmup
+from .utils.lr_scheduler import CosineDecayWithWarmup
 
 
 torch.manual_seed(42)
@@ -45,7 +45,7 @@ class tonfig:
     restore_best_weights:bool = True
 
     # MAGNeT and Model args
-    spanlen:int = MAGNET.spanlen # 3
+    spanlen:int = 3 # 3
     ## equal to the maximum length of the quantized codings for 10 seconds of audio
     seqlen:int = QCODING_LEN # 750
     attn_window:int = 5
@@ -79,35 +79,45 @@ class tonfig:
     device:str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc.
     device_type:str = "cuda" if "cuda" in device else "cpu"
 
-    # dtype args
-    dtype:str = "bfloat16"
+    # dtype args # 'encodec model as LSTMs which doesn't work with bfloat16'
+    dtype:str = "float16" # float16, float32
 #---------------------------------------------------------------------------------------------------#
 
 
 class PreProDataset:
-    def __init__(self, wav_paths:list[str], texts:list[str], audio_pad_id:int, wavlen:int):
+    def __init__(
+        self, 
+        wav_paths:list[str], 
+        texts:list[str], 
+        audio_pad_id:int, 
+        qcoding_len:int,
+        preprocess_ops:PreProOps,
+        device:str
+    ):
         self.wav_paths = wav_paths # (N//B, B)
         self.texts = texts # (N//B, B)
         self.audio_pad_id = audio_pad_id
-        self.wavlen = wavlen
+        self.qcoding_len = qcoding_len
+        self.device = torch.device(device)
+        self.preprocess_ops = preprocess_ops
     
     def preprocess(self, wavpaths:str, text_str:str):
         # pads to maxlen in batch
-        bs_wavs = list(map(preprocess_ops.preprocess_wavpath, wavpaths))
-        bs_wavs = nn.utils.rnn.pad_sequence(
-            sequences=bs_wavs,
+        quantized_codings = list(map(
+            lambda x: self.preprocess_ops.preprocess_wavpath(x, get_qcodings=True), 
+            wavpaths)
+        )# [[T=..., Nq=4], ...]
+
+        quantized_codings = nn.utils.rnn.pad_sequence(
+            sequences=quantized_codings,
             batch_first=True,
             padding_value=self.audio_pad_id
-        ) # (B, 1, len) where len is the maximim length in the list of wavs
-        # quatized codings
-        quantized_codings = preprocess_ops.getQuantizedCodings(
-            bs_waves=bs_wavs.unsqueeze(1) # add channel dimension
-        ) # (B, Nq=4, <=750)
+        ).movedim(1, -1) # (B, Nq=4, T<=750) <= (B, T<=750, Nq=4)
         
         # if maxlen<WAVLEN pad to WAVLEN
-        if quantized_codings.shape[-1] != self.wavlen: # if not 750
+        if quantized_codings.shape[-1] != self.qcoding_len: # if not 750
             quantized_codings = F.pad(
-                quantized_codings, (0, self.wavlen - bs_wavs.shape[-1]), value=self.audio_pad_id
+                quantized_codings, (0, self.qcoding_len - quantized_codings.shape[-1]), value=self.audio_pad_id
             ) # (B, Nq=4, 750)
         pad_mask = quantized_codings != self.audio_pad_id  # (B, T) # False value contains the padded tokens # True value is to be taken
         # Example = [[0,    1,   2, 1024, 1024],
@@ -116,7 +126,7 @@ class PreProDataset:
         # [[True, True, True, False, False],
         #  [True, True, True, True, False]]
         
-        return {"wav": bs_wavs, "mask": pad_mask}, text_str
+        return {"qcode": quantized_codings, "mask": pad_mask}, text_str
     
     def iter_batches(self):
         while True:
@@ -125,20 +135,27 @@ class PreProDataset:
                 wavs, text_str = self.preprocess(batched_wavpath, batched_text_str)
                 yield wavs, text_str
 
-
 class MagnetTrainer:
-    def __init__(self, config:tonfig):
+    def __init__(
+        self, 
+        magnet_model:nn.Module, 
+        preprocess_ops:PreProOps, 
+        config:tonfig,
+    ):
         self.magnet_model = magnet_model
         self.span_len = config.spanlen
         self.mask_id = config.mask_id
+        self.device = torch.device(config.device)
     
         self._num_spans_to_mask = torch.tensor(
-            self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen)
+            self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen),
+            device=self.device
         ) # (100,)
         self._att_mask = self._magnet_restricted_att_mask(
             shape=(config.seqlen, config.seqlen),
             windows=(config.attn_window, config.attn_window)
         )
+        self.preprocess_ops = preprocess_ops
 
     def _get_number_of_spans_to_mask(self, T:int, L:int):
         """
@@ -172,17 +189,15 @@ class MagnetTrainer:
         """
         B = len(mask_rates)
 
-        indexes = torch.round(mask_rates*100) # indexes to take from num_spans_to_mask # (B,)
+        indexes = torch.round(mask_rates*100).to(self.device).to(torch.int64) # indexes to take from num_spans_to_mask # (B,)
         # contains number of spans to mask
-        batched_num_spans = torch.tensor(
-            self._num_spans_to_mask
-        ).gather(dim=0, index=torch.tensor(indexes)).clip(min=1)
+        batched_num_spans = self._num_spans_to_mask.gather(dim=0, index=indexes).clip(min=1)
         
-        batch_randperm = torch.rand((B, seq_len)).argsort(-1) # rand integers from 0 to T
+        batch_randperm = torch.rand((B, seq_len), device=self.device).argsort(-1) # rand integers from 0 to T
         mask = batch_randperm < batched_num_spans[..., None] # contains `batched_num_spans` number of Trues
         shifted_mask = mask.clone()
         for _ in range(self.span_len-1):
-            shifted_mask = torch.concat((torch.full((B, 1), False), shifted_mask[:, :-1]), dim=-1)
+            shifted_mask = torch.concat((torch.zeros((B, 1), device=self.device).bool(), shifted_mask[:, :-1]), dim=-1)
             mask = torch.logical_or(mask, shifted_mask)
         return mask # (B, T) # True value will be masked
     
@@ -190,7 +205,7 @@ class MagnetTrainer:
     def _magnet_restricted_att_mask(self, shape:tuple, windows:tuple, dtype:torch.dtype=torch.float32):
         create_as = dtype if dtype is not torch.bfloat16 else torch.float32
         mask = torch.full(
-            shape, dtype=create_as, fill_value=1,
+            shape, dtype=create_as, fill_value=1, device=self.device
         )
 
         num_queries, num_keys = shape[-2:]
@@ -216,35 +231,41 @@ class MagnetTrainer:
         y_pred = y_pred[:, phase] # (B, T, cardinality)
 
         # take loss only on masked tokens (True value) # so mask the False value with -1
-        IGNORE_IDX = -1
-        y_true[loss_mask==False] = IGNORE_IDX
+        y_true[loss_mask==False] = -1
+        """
+        print("NUM -1", (y_true==-1).sum(-1))
+        print("y_true", y_true.shape, "\n\ny_pred\n", y_pred.shape, "\n\nloss_mask\n", loss_mask.shape, "\n\n")
+        print("y_pred.movedim(-1, -2)\n", y_pred.movedim(-1, -2).shape, "\n\ny_true\n", y_true, "\n\n")
+        """
         loss = F.cross_entropy(
-            y_pred, y_true, ignore_index=IGNORE_IDX
+            y_pred.movedim(-1, -2), # (B, num_classes=cardinatlity, d1=T) <= (B, T, cardinality)
+            y_true, # (B, d1=T)
+            ignore_index=-1
         )
         return loss
 
-    def mini_train_step(
+    def mini_train_step( # mini train step if gradient accumulation is used
         self,
         audio_input:dict[str, Tensor],
         padded_cond_str:list[str],
     ):
         """```
-        audio_input: {"wav": bs_wavs,   # tensor of shape (B, T)
-                      "mask": pad_mask} # tensor of shape (B, T)
+        audio_input: {"qcode": audio_tokens,   # tensor of shape (B, Nq, T)
+                      "mask": audio_pad_mask} # tensor of shape (B, Nq, T)
         conditioning_text: batch(text)
         ```"""
         # audio tensor and mask
         (
             audio_tokens,
             audio_pad_mask # False value contains the padded tokens # True value is to be taken # loss taken on True values
-        ) = audio_input["wav"], audio_input["mask"]
+        ) = audio_input["qcode"], audio_input["mask"]
 
         # Batch_dim, Codebooks, Time_dim
         B, Nq, T = audio_tokens.shape
 
         # conditioning tensor
-        padded_cond_seq = preprocess_ops.tokenize(padded_cond_str)
-        cond_tensor = preprocess_ops.get_conditioned_tensor(padded_cond_seq)
+        padded_cond_seq = self.preprocess_ops.tokenize(padded_cond_str)
+        cond_tensor = self.preprocess_ops.get_conditioned_tensor(padded_cond_seq)
 
         # A random phase: for masking a random codebook
         phase = r.randint(0, Nq-1)
@@ -259,7 +280,7 @@ class MagnetTrainer:
         
         # add phase mask to final_mask
         ## filed with False values only
-        final_mask = torch.zeros_like(audio_tokens).bool() # (B, Nq, T)
+        final_mask = torch.zeros_like(audio_tokens, device=self.device).bool() # (B, Nq, T)
         ## at index `phase`, fill with phase_mask (True values which will be masked)
         final_mask[:, phase, :] = phase_mask # (B, T)
         
@@ -272,26 +293,30 @@ class MagnetTrainer:
         loss_mask &= audio_pad_mask # (B, Nq, T)
 
         # mask all codebooks greater than phase with True values; True values will be masked
-        final_mask[:, (phase+1):, :] = torch.ones((B, Nq-(phase+1), T)).bool() # (B, Nq, T)
+        final_mask[:, (phase+1):, :] = torch.ones((B, Nq-(phase+1), T), device=self.device).bool() # (B, Nq, T)
         
         # use final_mask on audio tokens
         # where final_mask is True, replace with mask_id else audio_tokens
-        audio_tokens = torch.where(final_mask, self.mask_id, audio_tokens) # (B, Nq, T)
+        model_input_audio_tokens = torch.where(final_mask, self.mask_id, audio_tokens) # (B, Nq, T)
         
         logits:Tensor = self.magnet_model(
-            x=audio_tokens,
+            x=model_input_audio_tokens,
             conditioning_tensor=cond_tensor,
-            seq_mask=None,
-            cross_att_mask=None
+            # seq_mask=None,
+            # cross_att_mask=None
         ) # (B, Nq, T, cardinality)
 
         loss = self._magnet_cross_entropy(
             y_true=audio_tokens, y_pred=logits,
             loss_mask=loss_mask, phase=phase
         )
+        # (B, Nq, T) =sum(-1, -2)> (B,) =mean> ()
+        """print("SHAPE", logits.shape, audio_tokens.shape)
+        print("acc SHAPE", logits.argmax(-1).shape, audio_tokens.shape, 
+              "\n\nDTYPE", logits.argmax(-1).dtype, audio_tokens.dtype)
+        """
         with torch.no_grad():
-            # (B, Nq, T) =sum(-1, -2)> (B,) =mean> ()
-            accuracy = (logits.argmax(-1) == audio_tokens).sum(dim=(-1, -2)).mean()
+            accuracy = ((logits.argmax(-1) == audio_tokens).sum((-1, -2))/(B*T)).mean()
         return loss, accuracy
 
 
@@ -301,14 +326,14 @@ def evaluate():
 
     mean_losses, mean_metrics = [], []
     for eval_iterator in [train_iterator, val_iterator]:
-        losses = torch.empty((tonfig.eval_steps,))
-        metrics = torch.empty_like(losses)
+        losses = torch.empty((tonfig.eval_steps,), device=tonfig.device)
+        metrics = torch.empty_like(losses, device=tonfig.device)
 
         for eval_step in range(tonfig.eval_steps):
             audio_input, cond_text = next(eval_iterator)
             with ctx:
                 loss, acc = magnet_trainer.mini_train_step(
-                    audio_input=audio_input, 
+                    audio_input=audio_input,
                     padded_cond_str=cond_text
                 )
             losses[eval_step], metrics[eval_step] = loss, acc
@@ -361,7 +386,8 @@ def train():
             with ctx:
                 loss, accuracy = magnet_trainer.mini_train_step(
                     audio_input=audio_input, conditioning_text=cond_text
-                )/tonfig.num_grad_accumalation_steps
+                )
+                loss /= tonfig.num_grad_accumalation_steps
                 # async prefetch immediately
                 audio_input, cond_text = next(train_iterator)
 
@@ -424,14 +450,13 @@ if __name__ == "__main__":
 
     preprocess_ops = PreProOps(max_sec=MAX_SEC, device=tonfig.device)
     
-    train_iterator, val_iterator = (
+    iterator = lambda X, y: iter(
         PreProDataset(
-            X_train, y_train, audio_pad_id=tonfig.mask_id, wavlen=preprocess_ops.WAVLEN
-        ).iter_batches(),
-        PreProDataset(
-            X_val, y_val, audio_pad_id=tonfig.mask_id, wavlen=preprocess_ops.WAVLEN
+            X, y, audio_pad_id=tonfig.mask_id, 
+            wavlen=preprocess_ops.WAVLEN, device=tonfig.device
         ).iter_batches()
     )
+    train_iterator, val_iterator = iterator(X_train, y_train), iterator(X_val, y_val)
     # lr scheduler
     get_lr = CosineDecayWithWarmup(
         warmup_steps=tonfig.warmup_steps,
