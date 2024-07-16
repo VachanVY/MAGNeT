@@ -3,7 +3,6 @@ import math
 import bisect
 import random as r
 import dataclasses as dc
-import contextlib as ctxlib
 import os
 import time
 import matplotlib.pyplot as plt
@@ -23,7 +22,7 @@ from .preprocess_ops import PreProOps
 from .model import (
     monfig,
     MAGNET,
-    TransformerDecoder
+    Transformer
 )
 from .utils.lr_scheduler import CosineDecayWithWarmup
 
@@ -35,8 +34,8 @@ torch.backends.cudnn.allow_tf32 = True
 @dc.dataclass
 class tonfig:
     # general train args
-    num_steps:int = 1_000_000
-    batch_size:int = 16
+    num_steps:int = 10000 # 1_000_000
+    batch_size:int = 64
     num_grad_accumalation_steps:int = 1
     log_interval:int = 1
 
@@ -79,7 +78,7 @@ class tonfig:
     device:str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc.
     device_type:str = "cuda" if "cuda" in device else "cpu"
 
-    # dtype args # 'encodec model as LSTMs which doesn't work with bfloat16'
+    # dtype args # 'encodec model has LSTMs which doesn't work with bfloat16'
     dtype:str = "float16" # float16, float32
 #---------------------------------------------------------------------------------------------------#
 
@@ -138,7 +137,7 @@ class PreProDataset:
 class MagnetTrainer:
     def __init__(
         self, 
-        magnet_model:nn.Module, 
+        magnet_model:MAGNET, 
         preprocess_ops:PreProOps, 
         config:tonfig,
     ):
@@ -151,10 +150,6 @@ class MagnetTrainer:
             self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen),
             device=self.device
         ) # (100,)
-        self._att_mask = self._magnet_restricted_att_mask(
-            shape=(config.seqlen, config.seqlen),
-            windows=(config.attn_window, config.attn_window)
-        )
         self.preprocess_ops = preprocess_ops
 
     def _get_number_of_spans_to_mask(self, T:int, L:int):
@@ -200,21 +195,6 @@ class MagnetTrainer:
             shifted_mask = torch.concat((torch.zeros((B, 1), device=self.device).bool(), shifted_mask[:, :-1]), dim=-1)
             mask = torch.logical_or(mask, shifted_mask)
         return mask # (B, T) # True value will be masked
-    
-    # from xformers.ops.fmha.attn_bias.LocalAttentionFromBottomRightMask
-    def _magnet_restricted_att_mask(self, shape:tuple, windows:tuple, dtype:torch.dtype=torch.float32):
-        create_as = dtype if dtype is not torch.bfloat16 else torch.float32
-        mask = torch.full(
-            shape, dtype=create_as, fill_value=1, device=self.device
-        )
-
-        num_queries, num_keys = shape[-2:]
-        shift = num_keys - num_queries
-
-        mask = torch.triu(mask, diagonal=shift - windows[0])
-        mask = torch.tril(mask, diagonal=shift + windows[1])
-        mask = torch.log(mask)
-        return mask.to(dtype)
 
     # TODO: Implement this
     def _cfg(self):
@@ -230,7 +210,7 @@ class MagnetTrainer:
         y_true, loss_mask = y_true[:, phase], loss_mask[:, phase] # (B, T)
         y_pred = y_pred[:, phase] # (B, T, cardinality)
 
-        # take loss only on masked tokens (True value) # so mask the False value with -1
+        # take loss only on masked tokens (True value) # so -1 the False values
         y_true[loss_mask==False] = -1
         """
         print("NUM -1", (y_true==-1).sum(-1))
@@ -252,7 +232,7 @@ class MagnetTrainer:
         """```
         audio_input: {"qcode": audio_tokens,   # tensor of shape (B, Nq, T)
                       "mask": audio_pad_mask} # tensor of shape (B, Nq, T)
-        conditioning_text: batch(text)
+        padded_cond_str: batch(text)
         ```"""
         # audio tensor and mask
         (
@@ -301,9 +281,7 @@ class MagnetTrainer:
         
         logits:Tensor = self.magnet_model(
             x=model_input_audio_tokens,
-            conditioning_tensor=cond_tensor,
-            # seq_mask=None,
-            # cross_att_mask=None
+            conditioning_tensor=cond_tensor
         ) # (B, Nq, T, cardinality)
 
         loss = self._magnet_cross_entropy(
@@ -316,7 +294,7 @@ class MagnetTrainer:
               "\n\nDTYPE", logits.argmax(-1).dtype, audio_tokens.dtype)
         """
         with torch.no_grad():
-            accuracy = ((logits.argmax(-1) == audio_tokens).sum((-1, -2))/(B*T)).mean()
+            accuracy = ((logits.argmax(-1) == audio_tokens).sum((-1, -2))/(Nq*T)).mean()
         return loss, accuracy
 
 
@@ -440,6 +418,7 @@ def train():
 
 if __name__ == "__main__":
     # dataset
+    assert "cuda" in tonfig.device, "Only cuda is supported for training."
     dataset = ioPathTextDs(
         save_path=AUDIO_TXT_PATH,
         batch_size=tonfig.batch_size,
@@ -448,7 +427,20 @@ if __name__ == "__main__":
     X_train, y_train = dataset["train"]
     X_val, y_val = dataset["val"]
 
-    preprocess_ops = PreProOps(max_sec=MAX_SEC, device=tonfig.device)
+    # for float16 or bfloat16 training
+    ctx = torch.autocast(
+                device_type=tonfig.device_type,
+                dtype={"bfloat16": torch.bfloat16,
+                       "float16" : torch.float16}[tonfig.dtype]
+            )
+
+    preprocess_ops = PreProOps(
+        max_sec=MAX_SEC, 
+        device=tonfig.device,
+        autocast=ctx,
+        compile=True,
+        print_info=True
+    )
     
     iterator = lambda X, y: iter(
         PreProDataset(
@@ -464,22 +456,13 @@ if __name__ == "__main__":
         decay_steps=tonfig.decay_steps,
         min_learning_rate=tonfig.min_learning_rate
     )
-    # for float16 or bfloat16 training
-    ctx = (
-        ctxlib.nullcontext() if "cpu" in tonfig.device_type
-        else torch.autocast(
-                device_type=tonfig.device_type,
-                dtype={"bfloat16": torch.bfloat16,
-                       "float16" : torch.float16}[tonfig.dtype]
-            )
-    )
 
     os.makedirs(tonfig.ckpt_dir, exist_ok=True)
     if "scratch" in tonfig.init_from:
         model_config = monfig
         model_args = dc.asdict(monfig)
         magnet_model = MAGNET(
-            model=TransformerDecoder(model_config),
+            model=Transformer(model_config),
             config=model_config
         )
 
@@ -493,7 +476,7 @@ if __name__ == "__main__":
         model_args = checkpoint["model_args"]
         model_config = monfig(**model_args)
         magnet_model = MAGNET(
-            model=TransformerDecoder(model_config),
+            model=Transformer(model_config),
             config=model_config
         )
         state_dict:dict[str, Tensor] = checkpoint["model_state"]
@@ -524,7 +507,7 @@ if __name__ == "__main__":
     magnet_model = torch.compile(magnet_model)
     print("Done.")
 
-    magnet_trainer = MagnetTrainer(config=tonfig)
+    magnet_trainer = MagnetTrainer(magnet_model=magnet_model, preprocess_ops=preprocess_ops, config=tonfig)
 
     print("Training to be started...")
     losses, accuracies = train()
@@ -535,5 +518,5 @@ if __name__ == "__main__":
     plt.ylabel("Loss/Accuracy")
     plt.xlabel("Steps")
     plt.show()
-    plt.savefig("loss_accuracy.png")
+    plt.savefig("images/loss_accuracy.png")
     print("Training done.")

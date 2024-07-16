@@ -7,6 +7,7 @@ import torch
 from torch import (
     nn, Tensor
 )
+from torch.nn import functional as F
 
 from .music_bench import QCODING_LEN
 from .utils import sample_tokens
@@ -15,53 +16,158 @@ from .utils import sample_tokens
 class monfig: # model config
     d_model:int = 512
     num_heads:int = 8
+    assert d_model % num_heads == 0
+    assert d_model % 2 == 0
     dropout_rate:float = 0.0
     num_layers:int = 8
+    out_norm:bool = True
+    attn_window:int = 5
 
     cardinality:int = 1024 # sorta like vocab_size
     num_codebooks:int = 4
-
     max_seq_len:int = QCODING_LEN
 
+    conditioning_dim:int = 512
 
-class TransformerDecoder(nn.Module):
-    """```
-    Args: config
-    Input:
-        seq:Tensor,               # (B, T, d_model)  # q
-        cond_tensor:Tensor,       # (B, N, cond_dim) # kv # output from t5-encoder model
-        cond_padding_mask:Tensor, # (B, N) # prompt padding mask
-        cross_att_mask:Tensor     # (T, N) # mask in cross attention due to padding in cond_tensor
-    ```"""
+
+def get_sinusoidal_positional_embeddings(maxlen:int, dim:int) -> Tensor:
+    import numpy as np
+    p, i = np.meshgrid(np.arange(float(maxlen)), np.arange(dim/2.)*2)
+    theta = (p/1e4**(i/dim)).T
+
+    pos_emb = np.stack([np.sin(theta), np.cos(theta)], axis=-1)
+    pos_emb = pos_emb.reshape((maxlen, dim))[None] # (B=1, maxlen, dim)
+    return torch.from_numpy(pos_emb)
+
+# from xformers.ops.fmha.attn_bias.LocalAttentionFromBottomRightMask
+def magnet_restricted_att_mask(shape:tuple, windows:tuple, dtype:torch.dtype=torch.float32):
+    create_as = dtype if dtype is not torch.bfloat16 else torch.float32
+    mask = torch.full(
+        shape, dtype=create_as, fill_value=1
+    )
+
+    num_queries, num_keys = shape[-2:]
+    shift = num_keys - num_queries
+
+    mask = torch.triu(mask, diagonal=shift - windows[0])
+    mask = torch.tril(mask, diagonal=shift + windows[1])
+    mask = torch.log(mask)
+    return mask.to(dtype)
+
+
+# https://github.com/facebookresearch/audiocraft/blob/adf0b04a4452f171970028fcf80f101dd5e26e19/audiocraft/modules/transformer.py#L138
+class Attention(nn.Module):
     def __init__(self, config:monfig):
         super().__init__()
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer=nn.TransformerDecoderLayer(
-                d_model=config.d_model,
-                nhead=config.num_heads,
-                dim_feedforward=config.d_model*4,
-                dropout=config.dropout_rate,
-                batch_first=True,
-                norm_first=True
-            ),
-            num_layers=config.num_layers,
-            norm=nn.LayerNorm(config.d_model)
+        self.wq = nn.LazyLinear(config.d_model) # commented a warning in the source code for Lazy Modules
+        self.wk = nn.LazyLinear(config.d_model)
+        self.wv = nn.LazyLinear(config.d_model)
+
+        self.w = nn.Linear(config.d_model, config.d_model)
+
+        self.num_heads = config.num_heads
+        self.hdim = config.d_model // config.num_heads
+        self.dropout_rate = config.dropout_rate
+
+    def forward(
+        self,     # CROSS ATTN       SELF ATTN
+        q:Tensor, # (B, T, d_model); (B, T, d_model)
+        k:Tensor, # (B, N, dim)    ; (B, T, d_model)
+        v:Tensor, # (B, N, dim)    ; (B, T, d_model)
+        # dim: dimention from conditioning tensor
+        attn_mask:tp.Optional[Tensor]=None # ONLY FOR SELF ATTENTION
+        # (T, T) A float mask of the same type as query, key, value that is added to the attention score.
+    ):
+        T, N = q.shape[1], k.shape[1]
+        q, k, v = self.wq(q), self.wk(k), self.wv(v) # (B, T, d_model), (B, N, d_model), (B, N, d_model)
+
+        q = q.view(-1, T, self.num_heads, self.hdim).transpose(1, 2) # (B, num_heads, T, hdim)
+        k = k.view(-1, N, self.num_heads, self.hdim).transpose(1, 2) # (B, num_heads, N, hdim)
+        v = v.view(-1, N, self.num_heads, self.hdim).transpose(1, 2) # (B, num_heads, N, hdim)
+
+        # Flash Attn Shapes: q: (B, ..., T, hdim); k: (B, ..., N, hdim); v: (B, ..., N, hdim) => (B, ..., T, hdim)
+        att_out = F.scaled_dot_product_attention(
+            query=q, key=k, value=v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_rate if self.training else 0.0
+        ) # (B, num_heads, T, hdim)
+        att_out = att_out.transpose(1, 2).contiguous().view(-1, T, self.hdim*self.num_heads) # (B, num_heads, T, hdim) => (B, T, d_model)
+        
+        linear_att_out = self.w(att_out) # (B, T, d_model)
+        return linear_att_out
+                
+
+# https://github.com/facebookresearch/audiocraft/blob/adf0b04a4452f171970028fcf80f101dd5e26e19/audiocraft/modules/transformer.py#L454
+class TransformerLayer(nn.Module):
+    """Not Causal Decoder Transformer"""
+    def __init__(self, config:monfig):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.d_model)
+        self.satt = Attention(config)
+        self.dropout1 = nn.Dropout(config.dropout_rate)
+
+        self.norm2 = nn.LayerNorm(config.d_model)
+        self.catt = Attention(config)
+        self.dropout2 = nn.Dropout(config.dropout_rate)
+
+        self.norm3 = nn.LayerNorm(config.d_model)
+        self.ffn = nn.Sequential( # ffn like in torch.nn.TransformerEncoderLayer
+            nn.Linear(config.d_model, config.d_model*4),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(config.dropout_rate),
+            nn.Linear(config.d_model*4, config.d_model),
+            nn.Dropout(config.dropout_rate)
         )
 
     def forward(
         self,
-        seq:Tensor,
-        cond_tensor:tp.Optional[Tensor], # Optionally None in case of cfg
-        cond_padding_mask:tp.Optional[Tensor] = None,
-        cross_att_mask:tp.Optional[Tensor] = None
-    ) -> Tensor:
-        return self.transformer_decoder(
-            tgt=seq, # sequence to decoder
-            memory=cond_tensor, # sequence from last layer of encoder # cross att shape (T, N)
-            memory_key_padding_mask=cond_padding_mask, # ??? prompt padding mask, from T5 model
-            memory_mask=cross_att_mask # ??? mask in cross attention due to padding in cond_tensor
-        ) # (B, T, d_model)
+        xrc:Tensor, # (B, T, d_model)
+        conditioning_tensor:tp.Optional[Tensor]=None, # (B, N, cond_dim)
+        xrc_att_mask:tp.Optional[Tensor]=None, # (T, T) # FOR SELF ATTN ONLY, NOT FOR CROSS ATTN
+        # cond_att_mask:tp.Optional[Tensor]=None
+    ):
+        # First SubBlock
+        sattn_in = self.norm1(xrc)
+        xrc = xrc + self.dropout1(self.satt(sattn_in, sattn_in, sattn_in, xrc_att_mask)) # (B, T, d_model)
 
+        # Second SubBlock
+        if conditioning_tensor is not None:
+            xrc = xrc + self.dropout2(self.catt(self.norm2(xrc), conditioning_tensor, conditioning_tensor, None)) # (B, T, d_model)
+
+        # Third SubBlock
+        xrc = xrc + self.ffn(self.norm3(xrc)) # (B, T, d_model)
+        return xrc
+
+# https://github.com/facebookresearch/audiocraft/blob/adf0b04a4452f171970028fcf80f101dd5e26e19/audiocraft/modules/transformer.py#L577
+class Transformer(nn.Module):
+    def __init__(self, config:monfig):
+        super().__init__()
+        self.register_buffer(
+            "pos_emebddings", 
+            get_sinusoidal_positional_embeddings(config.max_seq_len, config.d_model) # (B=1, T, d_model)
+        )
+
+        self.blocks = nn.ModuleList([
+            TransformerLayer(config) for _ in range(config.num_layers)
+        ])
+        self.out_norm = None
+        if config.out_norm:
+            self.out_norm = nn.LayerNorm(config.d_model)
+        
+        
+    def forward(
+        self,
+        xrc:Tensor, # (B, T, d_model)
+        conditioning_tensor:Tensor, # (B, N, cond_dim)
+        xrc_att_mask:Tensor, # (T, T) # FOR SELF ATTN ONLY
+    ):
+        xrc += self.pos_emebddings
+        for block in self.blocks:
+            xrc = block(xrc, conditioning_tensor, xrc_att_mask)
+        if self.out_norm is not None:
+            xrc = self.out_norm(xrc)
+        return xrc
+        
 
 class MAGNET(nn.Module):
     """```
@@ -76,7 +182,7 @@ class MAGNET(nn.Module):
     ```"""
     def __init__(
         self,
-        model:nn.Module,
+        model:Transformer,
         config:monfig # Model config
     ):
         super().__init__()
@@ -84,6 +190,11 @@ class MAGNET(nn.Module):
         self.nq = config.num_codebooks # nq
         self.cardinality = config.cardinality
 
+        self.register_buffer("restricted_att_mask", magnet_restricted_att_mask(
+                shape=(self.maxlen, self.maxlen),
+                windows=(config.attn_window, config.attn_window)
+            )
+        )
         self.model = model
         self.embeddings = nn.ModuleList([
             nn.Embedding(
@@ -105,9 +216,10 @@ class MAGNET(nn.Module):
         # seq_mask:tp.Optional[Tensor]=None, # (B, T) # were doing this manually in the training loop...
         # cross_att_mask:tp.Optional[Tensor]=None # (T, N)
     ):
-        # emb: (cardinality {in dimension T}, d_model) ==x[:, codebook]: (B, T)=> (B, T, d_model)
+        T = x.shape[-1]
+        # emb: sum((cardinality {in dimension T}, d_model) ==x[:, codebook]:=(B, T)=> (B, T, d_model)s)
         x = sum([self.embeddings[codebook](x[:, codebook]) for codebook in range(self.nq)]) # (B, T, d_model)
-        x = self.model(x, conditioning_tensor) #, seq_mask, cross_att_mask) # (B, T, d_model)
+        x = self.model(x, conditioning_tensor, self.restricted_att_mask[:T, :T]) #, seq_mask, cross_att_mask) # (B, T, d_model)
         # stack((B, T, cardinality), dim=1) => (B, nq, T, cardinality)
         x = torch.stack([self.linears[codebook](x) for codebook in range(self.nq)], dim=1)
         return x # (B, nq, T, cardinality)
@@ -144,6 +256,7 @@ class MAGNET(nn.Module):
     @property
     def mask_id(self): return self.cardinality
        
+    ############################### To be Tested ######################################
     @torch.inference_mode()
     def generate(
         self,
@@ -301,4 +414,53 @@ class MAGNET(nn.Module):
         else:
             sampler = lambda logits: sample_tokens.multinomial(logits.softmax(dim=-1), num_samples=1)
         return sampler(probs)
-    
+
+
+def get_magnet_model():
+    # (B, Nq, T) # (B, N, cond_dim) # (T, T)
+    model = Transformer(monfig)
+    model = MAGNET(model, monfig) # build model, has lazy modules
+    x = torch.randint(0, 1024, (2, 4, 750))
+    conditioning_tensor = torch.randn((2, 10, 512))
+    ___ = model(x, conditioning_tensor)
+    return model
+
+# class TransformerDecoder(nn.Module):
+#     """```
+#     Args: config
+#     Input:
+#         seq:Tensor,               # (B, T, d_model)  # q
+#         cond_tensor:Tensor,       # (B, N, cond_dim) # kv # output from t5-encoder model
+#         cond_padding_mask:Tensor, # (B, N) # prompt padding mask
+#         cross_att_mask:Tensor     # (T, N) # mask in cross attention due to padding in cond_tensor
+#     ```"""
+#     def __init__(self, config:monfig):
+#         super().__init__()
+#         self.transformer_decoder = nn.TransformerDecoder(
+#             decoder_layer=nn.TransformerDecoderLayer(
+#                 d_model=config.d_model,
+#                 nhead=config.num_heads,
+#                 dim_feedforward=config.d_model*4,
+#                 dropout=config.dropout_rate,
+#                 batch_first=True,
+#                 norm_first=True
+#             ),
+#             num_layers=config.num_layers,
+#             norm=nn.LayerNorm(config.d_model)
+#         )
+
+#     def forward(
+#         self,
+#         seq:Tensor,
+#         cond_tensor:tp.Optional[Tensor], # Optionally None in case of cfg
+#         attn_mask:Tensor,
+#         cond_padding_mask:tp.Optional[Tensor] = None,
+#         cross_att_mask:tp.Optional[Tensor] = None
+#     ) -> Tensor:
+#         return self.transformer_decoder(
+#             tgt=seq, # sequence to decoder
+#             memory=cond_tensor, # sequence from last layer of encoder # cross att shape (T, N)
+#             tgt_mask=attn_mask,
+#             memory_key_padding_mask=cond_padding_mask, # ??? prompt padding mask, from T5 model
+#             memory_mask=cross_att_mask # ??? mask in cross attention due to padding in cond_tensor
+#         ) # (B, T, d_model)

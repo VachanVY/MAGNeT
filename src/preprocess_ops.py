@@ -17,12 +17,14 @@ T5_MODEL_PATH = "google-t5/t5-small"
 class PreProOps:
     def __init__(
         self, 
-        max_sec:float|int, 
-        print_info:bool=False, 
+        max_sec:float|int,
+        autocast:torch.autocast,
+        print_info:bool=False,
         compile:bool=True, 
         device:str="cuda"
     ):
         self.device = torch.device(device)
+        self.autocast = autocast
         
         self.encodec_model = EncodecModel.encodec_model_24khz()
         self.encodec_model.set_target_bandwidth(3.0) # 3 kbps (Nq = 4)
@@ -58,7 +60,8 @@ class PreProOps:
     
     def getQuantizedCodings(self, bs_waves:torch.Tensor) -> torch.Tensor: # (B, C=1, T=WAVLEN)
         with torch.no_grad():
-            encoded_frames = self.encodec_model.encode(bs_waves.to(self.device))
+            with self.autocast:
+                encoded_frames = self.encodec_model.encode(bs_waves.to(self.device))
         codes = encoded_frames[0][0] # (B, n_q=4, T=750)
         return codes
     
@@ -66,15 +69,17 @@ class PreProOps:
         codes.to(self.device)
         encoded_frames = [(codes, None)]
         with torch.no_grad():
-            wavs = self.encodec_model.decode(encoded_frames)
+            with self.autocast:
+                wavs = self.encodec_model.decode(encoded_frames)
         return wavs
     
     def get_conditioned_tensor(self, padded_cond_seq:dict[str, torch.Tensor]) -> torch.Tensor:
         with torch.no_grad():
-            cond_tensors = self.cond_model(
-                input_ids=padded_cond_seq["input_ids"].to(self.device), # (B, N)
-                attention_mask=padded_cond_seq["attention_mask"].to(self.device) # (B, N)
-            )
+            with self.autocast:
+                cond_tensors = self.cond_model(
+                    input_ids=padded_cond_seq["input_ids"].to(self.device), # (B, N)
+                    attention_mask=padded_cond_seq["attention_mask"].to(self.device) # (B, N)
+                )
         return cond_tensors.last_hidden_state # (B, N, cond_dim)
     
     def tokenize(self, text_str:list[str], padding:bool=True) -> dict[str, torch.Tensor]:
