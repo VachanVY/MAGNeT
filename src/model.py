@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from .music_bench import QCODING_LEN
 from .utils import sample_tokens
 
+
 @dc.dataclass
 class monfig: # model config
     d_model:int = 512
@@ -27,7 +28,7 @@ class monfig: # model config
     num_codebooks:int = 4
     max_seq_len:int = QCODING_LEN
 
-    conditioning_dim:int = 512
+    spanlen:int = 3
 
 
 def get_sinusoidal_positional_embeddings(maxlen:int, dim:int) -> Tensor:
@@ -189,6 +190,7 @@ class MAGNET(nn.Module):
         self.maxlen = config.max_seq_len
         self.nq = config.num_codebooks # nq
         self.cardinality = config.cardinality
+        self.spanlen = config.spanlen
 
         self.register_buffer("restricted_att_mask", magnet_restricted_att_mask(
                 shape=(self.maxlen, self.maxlen),
@@ -256,13 +258,12 @@ class MAGNET(nn.Module):
     @property
     def mask_id(self): return self.cardinality
        
-    ############################### To be Tested ######################################
     @torch.inference_mode()
     def generate(
         self,
         prompt:str|list[str],
-        tokenizer:tp.Callable[[str], Tensor],
-        cond_model:nn.Module,
+        get_cond_tokens_func:tp.Callable[[str|list[str]], dict[str, Tensor]],
+        get_cond_tensors_func:tp.Callable[[dict[str, Tensor]], Tensor],
         device:torch.device,
         init_audio_tokens:tp.Optional[Tensor]=None,
         top_k:tp.Optional[int]=None,
@@ -270,23 +271,20 @@ class MAGNET(nn.Module):
         decoding_steps:list[int] = [20, 10, 10, 10]
     ) -> Tensor:
         # generate in eval mode
+        assert len(decoding_steps) == self.nq, "decoding_steps should be equal to nq"
         assert not self.training, "generation should be in eval mode"
         assert prompt is not None, "prompt shouldn't be None... until CFG is implemented"
+        init_audio_len = 0
         if init_audio_tokens is not None and isinstance(init_audio_tokens, Tensor):
             init_audio_tokens = init_audio_tokens.to(device)
             init_audio_len = init_audio_tokens.shape[-1]
             assert init_audio_tokens.shape[-2] == self.nq and init_audio_len < self.maxlen
 
-        tok_prompt:dict[str, Tensor] = tokenizer(
-            [prompt] if isinstance(prompt, str) else prompt, 
-            padding=True, return_tensors="pt"
+        tok_prompt = get_cond_tokens_func(
+            [prompt] if isinstance(prompt, str) else prompt
         ) # (B, N)
         B = tok_prompt["input_ids"].shape[0]
-        cond_model.to(device)
-        conditioning_tensor = cond_model(
-            input_ids=tok_prompt["input_ids"].to(device),
-            attention_mask=tok_prompt["attention_mask"].to(device)
-        ) # (B, N, D=512)
+        conditioning_tensor = get_cond_tensors_func(padded_cond_seq=tok_prompt) # (B, N, D=512)
         
         audio_tokens = torch.full((B, self.nq, self.maxlen), fill_value=self.mask_id).to(device) # (B, Nq, T)
         if init_audio_tokens is not None:
@@ -336,7 +334,7 @@ class MAGNET(nn.Module):
             phase_gen_tokens = phase_gen_tokens[..., :T]
         
         num_init_audio_chunks = init_audio_len // self.spanlen
-        # `span_scores`: high score if less probablity in the sampled tokens 
+        # `span_scores`: high score if less probablity in the sampled tokens
         span_scores = torch.zeros(chunked_shape, dtype=torch.float32, device=device) # (B, 1, num_chunks)
         # less score assigned to the initial audio chunks; so that they are not masked 
         # (only least probable spans are masked so that they are predicted by the model)
@@ -381,9 +379,18 @@ class MAGNET(nn.Module):
             # `mask`: True where top-k token; False when least probable token
             mask = (phase_gen_tokens == self.mask_id) # (B, 1, T)
             #                  (B, 1, T)          # (B, 1, T)      # (B, T, 1)[..., 0]
-            phase_gen_tokens = phase_gen_tokens.where(mask==False, generated_tokens[..., 0]) # (B, 1, T)
+            # phase_gen_tokens when condition is True else generated_tokens[..., 0]
+            # generated_tokens[..., 0] when mask is True else phase_gen_tokens
+            # print(mask.shape, phase_gen_tokens.shape, generated_tokens[..., None, 0].shape)
+            # print(audio_tokens[:, [phase], :].shape)
+            phase_gen_tokens = torch.where(
+                (mask==False)[:, 0], # (B, T)
+                phase_gen_tokens[:, 0], # (B, T)
+                generated_tokens[..., 0] # (B, T)
+            )[:, None] # (B, 1, T)
+            # print(phase_gen_tokens.shape)
             audio_tokens[:, [phase], :] = phase_gen_tokens # (B, Nq, T)
-
+            # print(phase_gen_tokens.shape)
             # probs of generated tokens
             #              (B, 1, T, cardinality)      # (B, T, 1).unsqueeze(1) => (B, 1, T, 1)
             sampled_tok_probs = probs.gather(dim=-1, index=generated_tokens.unsqueeze(1))[..., 0] # (B, 1, T) <= (B, 1, T, 1)
@@ -408,11 +415,11 @@ class MAGNET(nn.Module):
                 "Either `top_k` or `top_p` should be provided, both together are not yet supported."
             )
         elif top_k is not None:
-            sampler = lambda logits: sample_tokens.topK(logits=logits, k=top_k)
+            sampler = lambda probs: sample_tokens.topK(probs, k=top_k)
         elif top_p is not None:
-            sampler = lambda logits: sample_tokens.topP(logits=logits, p=top_p)
+            sampler = lambda probs: sample_tokens.topP(probs, p=top_p)
         else:
-            sampler = lambda logits: sample_tokens.multinomial(logits.softmax(dim=-1), num_samples=1)
+            sampler = lambda probs: sample_tokens.multinomial(probs, num_samples=1)
         return sampler(probs)
 
 
@@ -424,6 +431,9 @@ def get_magnet_model():
     conditioning_tensor = torch.randn((2, 10, 512))
     ___ = model(x, conditioning_tensor)
     return model
+
+from icecream import ic
+ic.configureOutput(outputFunction=lambda x: print(x, end="\n\n"))
 
 # class TransformerDecoder(nn.Module):
 #     """```

@@ -70,6 +70,8 @@ generative masked language model, conditioned on a semantic representation of th
     *(The guidance coefficient ${\lambda}(i)$ is used in the linear combination of the conditional and unconditional probabilities to obtain the final distribution for sampling during the text generation process)*
     * ${\lambda}_0=10$ and ${\lambda}_1=1$ (initial and final guidance coefficients respectively)
 
+* **Finally, for inference, we employ nucleus sampling with top-p $0.9$, and a temperature of $3.0$ that is linearly annealed to zero during decoding iterations. We use CFG with condition dropout rate of $0.3$ during training, and a guidance coefficient $10.0$ that is annealed to $1.0$ during iterative decoding**
+
 ### Implementation details
 * We evaluate MAGNET on the task of text-to-music generation and text-to-audio generation
 * **Encodec model: gets as input an audio segment and outputs a 50 Hz discrete representation.

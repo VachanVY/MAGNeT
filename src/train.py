@@ -44,7 +44,7 @@ class tonfig:
     restore_best_weights:bool = True
 
     # MAGNeT and Model args
-    spanlen:int = 3 # 3
+    spanlen:int = monfig.spanlen # 3
     ## equal to the maximum length of the quantized codings for 10 seconds of audio
     seqlen:int = QCODING_LEN # 750
     attn_window:int = 5
@@ -76,10 +76,11 @@ class tonfig:
 
     # device args
     device:str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc.
+    generator:torch.Generator = torch.Generator(device=device).manual_seed(42)
     device_type:str = "cuda" if "cuda" in device else "cpu"
 
     # dtype args # 'encodec model has LSTMs which doesn't work with bfloat16'
-    dtype:str = "float16" # float16, float32
+    dtype:str = "float16" # float16
 #---------------------------------------------------------------------------------------------------#
 
 
@@ -145,6 +146,7 @@ class MagnetTrainer:
         self.span_len = config.spanlen
         self.mask_id = config.mask_id
         self.device = torch.device(config.device)
+        self.generator = config.generator
     
         self._num_spans_to_mask = torch.tensor(
             self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen),
@@ -188,7 +190,7 @@ class MagnetTrainer:
         # contains number of spans to mask
         batched_num_spans = self._num_spans_to_mask.gather(dim=0, index=indexes).clip(min=1)
         
-        batch_randperm = torch.rand((B, seq_len), device=self.device).argsort(-1) # rand integers from 0 to T
+        batch_randperm = torch.rand((B, seq_len), device=self.device, generator=self.generator).argsort(-1) # rand integers from 0 to T
         mask = batch_randperm < batched_num_spans[..., None] # contains `batched_num_spans` number of Trues
         shifted_mask = mask.clone()
         for _ in range(self.span_len-1):
@@ -252,7 +254,7 @@ class MagnetTrainer:
         
         # masking rate = gamma(i, s) = cos(pi*(i-1)/(2*s)) where i is the decoding time step i ϵ [1, s]
         # during training time step i is randomly sampled, thus (i-1)/s is randomly sampled which is `rand_decoding_time`
-        rand_decoding_time = torch.rand(B) # (B,)
+        rand_decoding_time = torch.rand(B, device=self.device, generator=self.generator) # (B,)
         mask_rates = torch.cos(math.pi*rand_decoding_time/2) # (B,)
 
         # mask the tokens of the current phase in codebook # True value will be masked
@@ -293,9 +295,36 @@ class MagnetTrainer:
         print("acc SHAPE", logits.argmax(-1).shape, audio_tokens.shape, 
               "\n\nDTYPE", logits.argmax(-1).dtype, audio_tokens.dtype)
         """
-        with torch.no_grad():
-            accuracy = ((logits.argmax(-1) == audio_tokens).sum((-1, -2))/(Nq*T)).mean()
+        accuracy = self.get_accuracy(audio_tokens, logits.argmax(-1), loss_mask=loss_mask)
         return loss, accuracy
+    
+    @staticmethod
+    @torch.no_grad()
+    def get_accuracy(
+        y_true:Tensor, # (B, Nq, T)
+        y_pred:Tensor, # (B, Nq, T, cardinality)
+        loss_mask:tp.Optional[Tensor]=None # (B, Nq, T)
+    ):
+        y_true, y_pred = y_true.flatten(1), y_pred.flatten(1) # (B, Nq*T)
+        corr_bool = (y_true == y_pred)
+        num = y_true.shape[-1]
+        acc = (corr_bool.sum(-1)/num).mean().item()
+
+        if loss_mask is not None:
+            loss_mask = loss_mask.flatten(1)
+            batch_mask_acc = list(map(MagnetTrainer._masked_accuracy, y_true, y_pred, loss_mask))
+            return acc, sum(batch_mask_acc)/len(batch_mask_acc)
+        return acc
+    
+    def _masked_accuracy(
+        y_true:Tensor, # (Nq*T)
+        y_pred:Tensor, # (Nq*T)
+        mask:Tensor    # (Nq*T)
+    ):
+        corr_bool = y_true == y_pred
+        num = mask.sum(-1)
+        acc = corr_bool[mask].sum(-1)/num
+        return acc.item()
 
 
 @torch.no_grad()
@@ -314,7 +343,7 @@ def evaluate():
                     audio_input=audio_input,
                     padded_cond_str=cond_text
                 )
-            losses[eval_step], metrics[eval_step] = loss, acc
+            losses[eval_step], metrics[eval_step] = loss, acc[0]
         mean_losses.append(losses.mean())
         mean_metrics.append(metrics.mean())
 
@@ -322,8 +351,7 @@ def evaluate():
     return mean_losses, mean_metrics
 
 
-def train():
-    losses, accuracies = [], []
+def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
     audio_input, cond_text = next(train_iterator)
 
     print("Training about to start...")
@@ -334,9 +362,10 @@ def train():
         if step % tonfig.eval_freq == 0 and step > 0:
             mean_losses, mean_accuracies = evaluate()
             print(
-                    f"\t| Training Loss: {mean_losses[0]:.4f} || Training Accuracy: {mean_accuracies[0]:.4f} |" 
-                    f"| Validation Loss: {mean_losses[1]:.4f} || Validation Accuracy: {mean_accuracies[1]:.4f} |"
+                    f"\t| Training Loss: {mean_losses[0]:.4f} || Training Accuracy (Not Masked): {mean_accuracies[0]:.4f} |" 
+                    f"| Validation Loss: {mean_losses[1]:.4f} || Validation Accuracy (Not Masked): {mean_accuracies[1]:.4f} |"
                 )
+            # early stopping
             if mean_losses[1] < best_val_loss or tonfig.always_checkpoint:
                 best_val_loss = mean_losses[1]
                 wait = 0; best_step = step
@@ -347,7 +376,10 @@ def train():
                     "model_args": model_args,
                     "step": step,
                     "best_val_loss": best_val_loss,
-                    "train_config": dc.asdict(tonfig)
+                    "train_config": dc.asdict(tonfig),
+                    "losses": losses,
+                    "accuracies": accuracies,
+                    "mask_accuracies": mask_acc
                 }
                 print(f"saving checkpoint to {tonfig.ckpt_dir}")
                 torch.save(checkpoint, os.path.join(tonfig.ckpt_dir, "ckpt.pt"))
@@ -395,10 +427,10 @@ def train():
             # multiply as loss was scaled for gradient accumulation
             lossf = loss.item() * tonfig.num_grad_accumalation_steps
             print(
-                f"| Step: {step} || Loss: {lossf:.4f} || Accuracy: {accuracy:.4f} |"
+                f"| Step: {step} || Loss: {lossf:.4f} || Masked Accuracy: {accuracy[1]:.4f} | Accuracy: {accuracy[0]:.4f} |"
                 f"| LR: {lr:e} || dt: {dt*1000:.2f}ms |"
             )
-            losses.append(lossf); accuracies.append(accuracy)
+            losses.append(lossf); accuracies.append(accuracy[0]); mask_acc.append(accuracy[1])
 
         if wait > tonfig.patience:
             print(
@@ -406,14 +438,13 @@ def train():
                 f"Best Validation Loss: {best_val_loss}"
                 f"Best step: {best_step}"
             )
-            if tonfig.restore_best_weights:
-                model_state = torch.load(
-                    f=os.path.join(tonfig.ckpt_dir, "ckpt.pt"),
-                    map_location=tonfig.device
-                )["model_state"]
-                magnet_model.load_state_dict(model_state)
-            break
-    return losses, accuracy
+    if tonfig.restore_best_weights:
+        model_state = torch.load(
+            f=os.path.join(tonfig.ckpt_dir, "ckpt.pt"),
+            map_location=tonfig.device
+        )["model_state"]
+        magnet_model.load_state_dict(model_state)
+    return losses, accuracies
 
 
 if __name__ == "__main__":
@@ -429,10 +460,10 @@ if __name__ == "__main__":
 
     # for float16 or bfloat16 training
     ctx = torch.autocast(
-                device_type=tonfig.device_type,
-                dtype={"bfloat16": torch.bfloat16,
-                       "float16" : torch.float16}[tonfig.dtype]
-            )
+        device_type=tonfig.device_type,
+        dtype={"bfloat16": torch.bfloat16,
+                "float16" : torch.float16}[tonfig.dtype]
+    )
 
     preprocess_ops = PreProOps(
         max_sec=MAX_SEC, 
@@ -458,6 +489,7 @@ if __name__ == "__main__":
     )
 
     os.makedirs(tonfig.ckpt_dir, exist_ok=True)
+    losses, accuracies, mask_accuracies = [], [], []
     if "scratch" in tonfig.init_from:
         model_config = monfig
         model_args = dc.asdict(monfig)
@@ -489,6 +521,7 @@ if __name__ == "__main__":
         magnet_model.load_state_dict(state_dict)
         train_from_step = checkpoint["step"]
         best_val_loss = checkpoint["best_val_loss"]
+        losses, accuracies, mask_accuracies = checkpoint["losses"], checkpoint["accuracies"], checkpoint["mask_accuracies"]
 
     magnet_model.to(tonfig.device)
     
@@ -510,13 +543,15 @@ if __name__ == "__main__":
     magnet_trainer = MagnetTrainer(magnet_model=magnet_model, preprocess_ops=preprocess_ops, config=tonfig)
 
     print("Training to be started...")
-    losses, accuracies = train()
+    losses, accuracies = train(losses, accuracies, mask_accuracies)
     plt.title("Loss and Accuracy")
-    plt.plot({"losses": losses, "accuracies": accuracies})
+    plt.plot(losses, legend="Loss")
+    plt.plot(accuracies, legend="Accuracy")
     plt.xticks(range(0, tonfig.num_steps, 5000))
     plt.grid(True)
     plt.ylabel("Loss/Accuracy")
     plt.xlabel("Steps")
+    plt.legend()
     plt.show()
     plt.savefig("images/loss_accuracy.png")
     print("Training done.")
