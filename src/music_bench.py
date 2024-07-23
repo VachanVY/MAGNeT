@@ -32,13 +32,30 @@ def shuffle_preserve_order(a, b):
     a, b = zip(*combined)
     return a, b
 
+def get_shape(lst):
+    if not isinstance(lst, list):
+        return []
+    
+    shape = []
+    current_level = lst
+    while isinstance(current_level, list):
+        shape.append(len(current_level))
+        if len(current_level) == 0:
+            break
+        current_level = current_level[0]
+    
+    return shape
+
 
 def split_ds(x, y, split_float:float):
-    assert len(x) == len(y), f"len(x): {len(x)} and len(y): {len(y)}"
+    # assert len(x) == len(y), f"len(x): {len(x)} and len(y): {len(y)}"
     train_len = int(split_float*len(x))
 
     x_train, y_train = x[:train_len], y[:train_len]
     x_val, y_val = x[train_len:], y[train_len:]
+    
+    assert get_shape(x_train) == get_shape(y_train)
+    assert get_shape(x_val) == get_shape(y_val)
     return {
         "train": (x_train, y_train),
         "val": (x_val, y_val)
@@ -91,7 +108,7 @@ def download_dataset():
                 print(f"{file_path} is present, skipping downloading it.")
         
         # move unpacked files from diff folder to the one folder and delete src folder
-        src_dir = "data/MusicBench/datashare/data"
+        src_dir = os.path.join(DATA_DIR, "datashare/data")
         for fpath in os.listdir(src_dir):
             fpath = os.path.join(src_dir, fpath)
             shutil.move(src=fpath, dst=DATA_PATH)
@@ -99,7 +116,7 @@ def download_dataset():
         os.removedirs(src_dir)
         return
     print(
-        "Data already present, skipping downloading. If you want to redownload then delete data folder and run again.\n"
+        f"Data already present, skipping downloading. If you want to redownload then delete {DATA_DIR} folder and run again.\n"
     )
 
 
@@ -114,7 +131,7 @@ def ioPathTextDs(
         print("Saving dataset...")
         assert batch_size is not None, "provide batch_size when saving."
         paths, texts = [], []
-        with open('data/MusicBench/MusicBench_train_modified.json') as json_data:
+        with open(os.path.join(DATA_DIR, 'MusicBench_train_modified.json')) as json_data:
             for line in json_data:
                 # convert "string-dictionary" to dictionary
                 data:dict[str, str] = json.loads(line.replace("'", "/"))
@@ -152,7 +169,7 @@ def ioPathTextDs(
         print("Dataset is preprocessed.")
     if return_ds:
         return split_ds(paths, texts, split_float=split_float)
-  
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()

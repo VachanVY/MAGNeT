@@ -6,37 +6,44 @@ import dataclasses as dc
 import os
 import time
 import matplotlib.pyplot as plt
+from collections import OrderedDict
+from copy import deepcopy
+from tqdm import trange
 
-import torch
+import torch; torch.cuda.empty_cache()
 from torch import nn, Tensor
 from torch.nn import functional as F
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # use this if getting Out Of Memory Error
 
-from .music_bench import (
+from src.music_bench import (
     shuffle_preserve_order,
     ioPathTextDs,
     AUDIO_TXT_PATH,
     QCODING_LEN,
     MAX_SEC
 )
-from .preprocess_ops import PreProOps
-from .model import (
+from src.preprocess_ops import PreProOps
+from src.model import (
     monfig,
-    MAGNET,
-    Transformer
+    get_magnet_model,
+    MAGNET # only for type hinting
 )
-from .utils.lr_scheduler import CosineDecayWithWarmup
+from src.utils.lr_scheduler import CosineDecayWithWarmup
 
-
-torch.manual_seed(42)
+#---------------------------------------------------------------------------------------------------#
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 #---------------------------------------------------------------------------------------------------#
 @dc.dataclass
 class tonfig:
+    seed:int = 42
+
     # general train args
-    num_steps:int = 10000 # 1_000_000
+    num_steps:int = 100_000 # 1_000_000 in paper
     batch_size:int = 64
-    num_grad_accumalation_steps:int = 1
+    # number_of_tokens_per_update = batch_size*seqlen*num_grad_accumalation_steps = 64*750*3 = 144000
+    # Only one codebook is taken at a time, so all codebooks are not considered for number of tokens per update
+    num_grad_accumalation_steps:int = 3
     log_interval:int = 1
 
     # Early stopping args
@@ -49,15 +56,18 @@ class tonfig:
     seqlen:int = QCODING_LEN # 750
     attn_window:int = 5
 
+    # Classifier-Free Guidance
+    cfg_dropout:float = 0.1
+
     # vocab (without mask_id): {0, ..., 1023} => mask_id = 1024
     # cardinality = len(vocab) which is 1024
     mask_id:int = monfig.cardinality
 
     # cosine decay with warmup args
     warmup_steps:int = 1250
-    max_learning_rate:float = ...
+    max_learning_rate:float = 5e-4
     decay_steps:int = num_steps
-    min_learning_rate:float = ...
+    min_learning_rate:float = 0.0*max_learning_rate
 
     # optimizer args
     decay:bool = True # if true uses cosine decay else max_learning_rate thoughtout training
@@ -65,24 +75,26 @@ class tonfig:
     beta1:float = 0.9
     beta2:float = 0.95
     clipnorm:float = 1e0
-    ## ema_momentum:float = 0.99
+    ema_momentum:float = 0.99
 
     # eval and checkpointing args
     eval_freq:int = 2000
-    eval_steps:int = 200
-    init_from:str = 0
+    eval_steps:int = 100
+    init_from:str = "scratch" # 'scratch' or 'resume'
     ckpt_dir:str = "ckpts"
     always_checkpoint:bool = False
+    assert restore_best_weights != always_checkpoint
 
     # device args
     device:str = "cuda" # 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc.
-    generator:torch.Generator = torch.Generator(device=device).manual_seed(42)
     device_type:str = "cuda" if "cuda" in device else "cpu"
 
     # dtype args # 'encodec model has LSTMs which doesn't work with bfloat16'
     dtype:str = "float16" # float16
 #---------------------------------------------------------------------------------------------------#
-
+RANDGEN:r.Random = r.Random(tonfig.seed)
+GENRERATOR:torch.Generator = torch.Generator(device=tonfig.device).manual_seed(tonfig.seed+1)
+#---------------------------------------------------------------------------------------------------#
 
 class PreProDataset:
     def __init__(
@@ -146,8 +158,11 @@ class MagnetTrainer:
         self.span_len = config.spanlen
         self.mask_id = config.mask_id
         self.device = torch.device(config.device)
-        self.generator = config.generator
-    
+
+        self.generator = GENRERATOR
+        self.randgen = RANDGEN
+
+        self.cfg_dropout = config.cfg_dropout
         self._num_spans_to_mask = torch.tensor(
             self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen),
             device=self.device
@@ -198,10 +213,6 @@ class MagnetTrainer:
             mask = torch.logical_or(mask, shifted_mask)
         return mask # (B, T) # True value will be masked
 
-    # TODO: Implement this
-    def _cfg(self):
-        raise NotImplementedError
-
     def _magnet_cross_entropy(
         self,
         y_true:Tensor,    # (B, nq, T)
@@ -214,11 +225,7 @@ class MagnetTrainer:
 
         # take loss only on masked tokens (True value) # so -1 the False values
         y_true[loss_mask==False] = -1
-        """
-        print("NUM -1", (y_true==-1).sum(-1))
-        print("y_true", y_true.shape, "\n\ny_pred\n", y_pred.shape, "\n\nloss_mask\n", loss_mask.shape, "\n\n")
-        print("y_pred.movedim(-1, -2)\n", y_pred.movedim(-1, -2).shape, "\n\ny_true\n", y_true, "\n\n")
-        """
+
         loss = F.cross_entropy(
             y_pred.movedim(-1, -2), # (B, num_classes=cardinatlity, d1=T) <= (B, T, cardinality)
             y_true, # (B, d1=T)
@@ -229,12 +236,12 @@ class MagnetTrainer:
     def mini_train_step( # mini train step if gradient accumulation is used
         self,
         audio_input:dict[str, Tensor],
-        padded_cond_str:list[str],
+        cond_str:list[str],
     ):
         """```
         audio_input: {"qcode": audio_tokens,   # tensor of shape (B, Nq, T)
                       "mask": audio_pad_mask} # tensor of shape (B, Nq, T)
-        padded_cond_str: batch(text)
+        cond_str: batch(text)
         ```"""
         # audio tensor and mask
         (
@@ -246,11 +253,15 @@ class MagnetTrainer:
         B, Nq, T = audio_tokens.shape
 
         # conditioning tensor
-        padded_cond_seq = self.preprocess_ops.tokenize(padded_cond_str)
-        cond_tensor = self.preprocess_ops.get_conditioned_tensor(padded_cond_seq)
+        cond_tensor = self.magnet_model.cfg(
+            cond_str=cond_str,
+            randf=self.randgen.random(),
+            cfg_dropout=self.cfg_dropout,
+            preprocess_ops=self.preprocess_ops,
+        )
 
         # A random phase: for masking a random codebook
-        phase = r.randint(0, Nq-1)
+        phase = self.randgen.randint(0, Nq-1)
         
         # masking rate = gamma(i, s) = cos(pi*(i-1)/(2*s)) where i is the decoding time step i ϵ [1, s]
         # during training time step i is randomly sampled, thus (i-1)/s is randomly sampled which is `rand_decoding_time`
@@ -290,11 +301,7 @@ class MagnetTrainer:
             y_true=audio_tokens, y_pred=logits,
             loss_mask=loss_mask, phase=phase
         )
-        # (B, Nq, T) =sum(-1, -2)> (B,) =mean> ()
-        """print("SHAPE", logits.shape, audio_tokens.shape)
-        print("acc SHAPE", logits.argmax(-1).shape, audio_tokens.shape, 
-              "\n\nDTYPE", logits.argmax(-1).dtype, audio_tokens.dtype)
-        """
+        # (B, Nq, T) =sum(-1, -2)> (B,) =mean=> ()
         accuracy = self.get_accuracy(audio_tokens, logits.argmax(-1), loss_mask=loss_mask)
         return loss, accuracy
     
@@ -328,7 +335,17 @@ class MagnetTrainer:
 
 
 @torch.no_grad()
+def update_ema(ema_model:MAGNET, model:MAGNET, decay:float):
+    ema_params = OrderedDict(ema_model.named_parameters())
+    model_params = OrderedDict(model.named_parameters())
+
+    for name, param in model_params.items():
+        ema_params[name].mul_(decay).add_(param.data, alpha=1-decay)
+
+
+@torch.no_grad()
 def evaluate():
+    print("Evaluating...")
     magnet_model.eval()
 
     mean_losses, mean_metrics = [], []
@@ -336,12 +353,12 @@ def evaluate():
         losses = torch.empty((tonfig.eval_steps,), device=tonfig.device)
         metrics = torch.empty_like(losses, device=tonfig.device)
 
-        for eval_step in range(tonfig.eval_steps):
+        for eval_step in trange(tonfig.eval_steps):
             audio_input, cond_text = next(eval_iterator)
             with ctx:
                 loss, acc = magnet_trainer.mini_train_step(
                     audio_input=audio_input,
-                    padded_cond_str=cond_text
+                    cond_str=cond_text
                 )
             losses[eval_step], metrics[eval_step] = loss, acc[0]
         mean_losses.append(losses.mean())
@@ -352,14 +369,15 @@ def evaluate():
 
 
 def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
+    global best_val_loss, start_iter
     audio_input, cond_text = next(train_iterator)
 
     print("Training about to start...")
     t0 = time.time()
     wait = 0; best_step = 0 # for early stopping
-    for step in range(0, tonfig.num_steps):
-        # evaluate 
-        if step % tonfig.eval_freq == 0 and step > 0:
+    for step in range(start_iter, tonfig.num_steps):
+        # evaluate
+        if step % tonfig.eval_freq == 0 and step > start_iter:
             mean_losses, mean_accuracies = evaluate()
             print(
                     f"\t| Training Loss: {mean_losses[0]:.4f} || Training Accuracy (Not Masked): {mean_accuracies[0]:.4f} |" 
@@ -372,17 +390,19 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
 
                 checkpoint = {
                     "model_state": magnet_model.state_dict(),
+                    "ema_state": ema.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "model_args": model_args,
                     "step": step,
                     "best_val_loss": best_val_loss,
-                    "train_config": dc.asdict(tonfig),
+                    "train_config": dc.asdict(tonfig()),
                     "losses": losses,
                     "accuracies": accuracies,
                     "mask_accuracies": mask_acc
                 }
-                print(f"saving checkpoint to {tonfig.ckpt_dir}")
+                print(f"Saving checkpoint to {tonfig.ckpt_dir} ...", end=" ==> ")
                 torch.save(checkpoint, os.path.join(tonfig.ckpt_dir, "ckpt.pt"))
+                print("Done.")
             else:
                 wait += 1
 
@@ -395,8 +415,10 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
         for mini_step in range(tonfig.num_grad_accumalation_steps):
             with ctx:
                 loss, accuracy = magnet_trainer.mini_train_step(
-                    audio_input=audio_input, conditioning_text=cond_text
+                    audio_input=audio_input, cond_str=cond_text
                 )
+                if loss.isnan() or loss.isinf():
+                    raise RuntimeError(f"Step: {step}\nMini-Step: {mini_step}\nLoss: {loss}\nDIVERGING :(")
                 loss /= tonfig.num_grad_accumalation_steps
                 # async prefetch immediately
                 audio_input, cond_text = next(train_iterator)
@@ -408,11 +430,15 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
             # unscale the gradients
             scaler.unscale_(optimizer)
             # clips gradients in-place to grad norm
-            nn.utils.clip_grad_norm_(magnet_model.parameters(), max_norm=tonfig.clipnorm)
+            norm = nn.utils.clip_grad_norm_(magnet_model.parameters(), max_norm=tonfig.clipnorm, error_if_nonfinite=True)
 
         # calls unscale to the optimizer unless already called, checks for infs and nans as a part of unscale_
         # calls optimizer.step on unscaled grads if no infs and nans else optimizer.step is skipped
         scaler.step(optimizer)
+
+        # update ema
+        update_ema(ema, magnet_model, tonfig.ema_momentum)
+
         # Update the scale factor
         scaler.update()
 
@@ -423,12 +449,13 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
         t1 = time.time()
         dt = t1-t0
         t0 = t1
-        if step % tonfig.log_interval:
+        if step % tonfig.log_interval == 0:
             # multiply as loss was scaled for gradient accumulation
             lossf = loss.item() * tonfig.num_grad_accumalation_steps
             print(
                 f"| Step: {step} || Loss: {lossf:.4f} || Masked Accuracy: {accuracy[1]:.4f} | Accuracy: {accuracy[0]:.4f} |"
                 f"| LR: {lr:e} || dt: {dt*1000:.2f}ms |"
+                f"| Norm: {norm:.4f} |" if tonfig.clipnorm is not None else "" # if norm is not stable, something is wrong
             )
             losses.append(lossf); accuracies.append(accuracy[0]); mask_acc.append(accuracy[1])
 
@@ -443,26 +470,31 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
             f=os.path.join(tonfig.ckpt_dir, "ckpt.pt"),
             map_location=tonfig.device
         )["model_state"]
-        magnet_model.load_state_dict(model_state)
-    return losses, accuracies
+        magnet_model.load_state_dict(model_state) # load state maybe for eval after training, although not needed
+    return losses, accuracies, mask_acc
 
 
 if __name__ == "__main__":
     # dataset
+    # just kept this as float16 to get rid of out of memory error, but norm explodes and loss becomes nan, so keep it float32. dumb...
+    MODEL_DTYPE = torch.float32
     assert "cuda" in tonfig.device, "Only cuda is supported for training."
+    assert MODEL_DTYPE == torch.float32 # not to be confused with autocast dtype
+    
     dataset = ioPathTextDs(
         save_path=AUDIO_TXT_PATH,
         batch_size=tonfig.batch_size,
-        split_float=0.9
+        split_float=0.9,
+        return_ds=True
     )
     X_train, y_train = dataset["train"]
     X_val, y_val = dataset["val"]
+    del dataset
 
     # for float16 or bfloat16 training
     ctx = torch.autocast(
         device_type=tonfig.device_type,
-        dtype={"bfloat16": torch.bfloat16,
-                "float16" : torch.float16}[tonfig.dtype]
+        dtype=MODEL_DTYPE
     )
 
     preprocess_ops = PreProOps(
@@ -470,13 +502,14 @@ if __name__ == "__main__":
         device=tonfig.device,
         autocast=ctx,
         compile=True,
-        print_info=True
+        print_info=False,
+        dtype=MODEL_DTYPE
     )
     
     iterator = lambda X, y: iter(
         PreProDataset(
             X, y, audio_pad_id=tonfig.mask_id, 
-            wavlen=preprocess_ops.WAVLEN, device=tonfig.device
+            qcoding_len=tonfig.seqlen, preprocess_ops=preprocess_ops, device=tonfig.device
         ).iter_batches()
     )
     train_iterator, val_iterator = iterator(X_train, y_train), iterator(X_val, y_val)
@@ -489,42 +522,51 @@ if __name__ == "__main__":
     )
 
     os.makedirs(tonfig.ckpt_dir, exist_ok=True)
-    losses, accuracies, mask_accuracies = [], [], []
+    losses, accuracies, mask_accuracies, start_iter = [], [], [], 0
     if "scratch" in tonfig.init_from:
         model_config = monfig
-        model_args = dc.asdict(monfig)
-        magnet_model = MAGNET(
-            model=Transformer(model_config),
-            config=model_config
-        )
+        model_args = dc.asdict(monfig())
+        magnet_model = get_magnet_model(compile=True, monfig=model_config)
+        ema = deepcopy(magnet_model)
 
         train_from_step = 0
         best_val_loss = 1e9
         checkpoint = None
     elif "resume" in tonfig.init_from:
+        print("Resuming training using checkpoint...")
+        # TODO/NOTE: Is this needed?
+        def get_model_state(state_dict:dict[str, Tensor]):
+            unwanted_prefix = "_orig_mod." # this prefix gets added when a Model is compiled using torch.compile
+            for k, v in list(state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+            return state_dict
+                
         ckpt_path = os.path.join(tonfig.ckpt_dir, "ckpt.pt")
         checkpoint = torch.load(ckpt_path, map_location=tonfig.device)
 
         model_args = checkpoint["model_args"]
         model_config = monfig(**model_args)
-        magnet_model = MAGNET(
-            model=Transformer(model_config),
-            config=model_config
-        )
-        state_dict:dict[str, Tensor] = checkpoint["model_state"]
-        # TODO/NOTE: Is this needed?
-        unwanted_prefix = "_orig_mod."
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
+        start_iter = checkpoint["step"]
 
-        magnet_model.load_state_dict(state_dict)
+        magnet_model = get_magnet_model(compile=True, monfig=model_config)
+        ema = deepcopy(magnet_model)
+        
+        magnet_model.load_state_dict(checkpoint["model_state"])
+        ema.load_state_dict(checkpoint["ema_state"])
+
         train_from_step = checkpoint["step"]
         best_val_loss = checkpoint["best_val_loss"]
         losses, accuracies, mask_accuracies = checkpoint["losses"], checkpoint["accuracies"], checkpoint["mask_accuracies"]
 
-    magnet_model.to(tonfig.device)
-    
+    magnet_model.to(tonfig.device, dtype=MODEL_DTYPE); magnet_model.train()
+    ema.to(tonfig.device, dtype=MODEL_DTYPE); ema.eval() # use ema for sampling
+    ema.requires_grad_(False)
+    update_ema(ema, magnet_model, 0.0) # copy the weights
+    print("\nNumber of Parameters in MAGNET Model:", 
+            sum(p.numel() for p in magnet_model.parameters() if p.requires_grad)/1e6, "Million Parameters\n"
+        )
+
     scaler = torch.cuda.amp.GradScaler(enabled=(tonfig.device=="float16"))
     optimizer = magnet_model.configure_optimizers(
         weight_decay=tonfig.weight_decay,
@@ -532,22 +574,19 @@ if __name__ == "__main__":
         betas=(tonfig.beta1, tonfig.beta2),
         device_type=tonfig.device_type
     )
+    
     if ("resume" in tonfig.init_from) and ("optimizer" in checkpoint):
         optimizer.load_state_dict(checkpoint["optimizer"])
-        checkpoint = None # free memory
-
-    print("Compiling magnet model...")
-    magnet_model = torch.compile(magnet_model)
-    print("Done.")
+    checkpoint = None # free memory
 
     magnet_trainer = MagnetTrainer(magnet_model=magnet_model, preprocess_ops=preprocess_ops, config=tonfig)
 
-    print("Training to be started...")
-    losses, accuracies = train(losses, accuracies, mask_accuracies)
+    losses, accuracies, mask_accuracies = train(losses, accuracies, mask_accuracies)
     plt.title("Loss and Accuracy")
     plt.plot(losses, legend="Loss")
     plt.plot(accuracies, legend="Accuracy")
-    plt.xticks(range(0, tonfig.num_steps, 5000))
+    plt.plot(mask_accuracies, legend="Masked Accuracy")
+    plt.xticks(range(0, tonfig.num_steps, tonfig.num_steps//33.33333), rotation=90)
     plt.grid(True)
     plt.ylabel("Loss/Accuracy")
     plt.xlabel("Steps")

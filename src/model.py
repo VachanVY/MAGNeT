@@ -15,12 +15,12 @@ from .utils import sample_tokens
 
 @dc.dataclass
 class monfig: # model config
-    d_model:int = 512
-    num_heads:int = 8
+    d_model:int =  512
+    num_heads:int =  8
     assert d_model % num_heads == 0
     assert d_model % 2 == 0
     dropout_rate:float = 0.0
-    num_layers:int = 8
+    num_layers:int =  8
     out_norm:bool = True
     attn_window:int = 5
 
@@ -65,6 +65,7 @@ class Attention(nn.Module):
         self.wv = nn.LazyLinear(config.d_model)
 
         self.w = nn.Linear(config.d_model, config.d_model)
+        self.w.RESIDUAL_CONNECTION_SPECIAL_INIT = config.num_layers**-0.5
 
         self.num_heads = config.num_heads
         self.hdim = config.d_model // config.num_heads
@@ -119,6 +120,9 @@ class TransformerLayer(nn.Module):
             nn.Linear(config.d_model*4, config.d_model),
             nn.Dropout(config.dropout_rate)
         )
+        for layer in self.ffn[-2:-1]:
+            if isinstance(layer, nn.Linear):
+                layer.RESIDUAL_CONNECTION_SPECIAL_INIT = config.num_layers**-0.5
 
     def forward(
         self,
@@ -159,7 +163,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         xrc:Tensor, # (B, T, d_model)
-        conditioning_tensor:Tensor, # (B, N, cond_dim)
+        conditioning_tensor:tp.Optional[Tensor], # (B, N, cond_dim) # Optionally None when cfg is used
         xrc_att_mask:Tensor, # (T, T) # FOR SELF ATTN ONLY
     ):
         xrc += self.pos_emebddings
@@ -215,8 +219,6 @@ class MAGNET(nn.Module):
         self,
         x:Tensor, # (B, Nq, T)
         conditioning_tensor:tp.Optional[Tensor], # (B, N, cond_dim)
-        # seq_mask:tp.Optional[Tensor]=None, # (B, T) # were doing this manually in the training loop...
-        # cross_att_mask:tp.Optional[Tensor]=None # (T, N)
     ):
         T = x.shape[-1]
         # emb: sum((cardinality {in dimension T}, d_model) ==x[:, codebook]:=(B, T)=> (B, T, d_model)s)
@@ -225,6 +227,22 @@ class MAGNET(nn.Module):
         # stack((B, T, cardinality), dim=1) => (B, nq, T, cardinality)
         x = torch.stack([self.linears[codebook](x) for codebook in range(self.nq)], dim=1)
         return x # (B, nq, T, cardinality)
+    
+    def _init_weights(self, module:nn.Module):
+        # initialize the weights of the model
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "RESIDUAL_CONNECTION_SPECIAL_INIT"):
+                nn.init.normal_(module.weight, std=(1/module.weight.shape[0])*(module.RESIDUAL_CONNECTION_SPECIAL_INIT))
+            else:
+                nn.init.normal_(module.weight, std=1/module.weight.shape[0])
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        # scale the embedding weights by 1/sqrt(nq) as they are summed
+        if isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=(1/module.weight.shape[1])*(self.nq**-0.5))
+        
+        
     
     def configure_optimizers(
         self,
@@ -257,34 +275,47 @@ class MAGNET(nn.Module):
     
     @property
     def mask_id(self): return self.cardinality
+
+    @staticmethod
+    def cfg(cond_str:list[str], randf:float, cfg_dropout:float, preprocess_ops:tp.Any) -> tp.Optional[Tensor]:
+        """to disable cfg, set `cfg_dropout` to 0.0, for full cfg, set `cfg_dropout` to 1.0"""
+        if randf < cfg_dropout:
+            return None
+        padded_cond_seq = preprocess_ops.tokenize(cond_str)
+        cond_tensor = preprocess_ops.get_conditioned_tensor(padded_cond_seq)
+        return cond_tensor
        
     @torch.inference_mode()
     def generate(
         self,
-        prompt:str|list[str],
-        get_cond_tokens_func:tp.Callable[[str|list[str]], dict[str, Tensor]],
-        get_cond_tensors_func:tp.Callable[[dict[str, Tensor]], Tensor],
+        prompt:tp.Optional[str|list[str]],
+        preprocess_ops:tp.Any,
         device:torch.device,
         init_audio_tokens:tp.Optional[Tensor]=None,
         top_k:tp.Optional[int]=None,
         top_p:tp.Optional[float]=None,
-        decoding_steps:list[int] = [20, 10, 10, 10]
+        decoding_steps:list[int] = [20, 10, 10, 10],
+        num_samples:int = 1
     ) -> Tensor:
         # generate in eval mode
         assert len(decoding_steps) == self.nq, "decoding_steps should be equal to nq"
         assert not self.training, "generation should be in eval mode"
-        assert prompt is not None, "prompt shouldn't be None... until CFG is implemented"
         init_audio_len = 0
         if init_audio_tokens is not None and isinstance(init_audio_tokens, Tensor):
             init_audio_tokens = init_audio_tokens.to(device)
             init_audio_len = init_audio_tokens.shape[-1]
             assert init_audio_tokens.shape[-2] == self.nq and init_audio_len < self.maxlen
 
-        tok_prompt = get_cond_tokens_func(
-            [prompt] if isinstance(prompt, str) else prompt
-        ) # (B, N)
-        B = tok_prompt["input_ids"].shape[0]
-        conditioning_tensor = get_cond_tensors_func(padded_cond_seq=tok_prompt) # (B, N, D=512)
+        if prompt is not None:
+            tok_prompt = preprocess_ops.tokenize(
+                [prompt] if isinstance(prompt, str) else prompt
+            ) # (B, N)
+            B = tok_prompt["input_ids"].shape[0]
+            conditioning_tensor = preprocess_ops.get_conditioned_tensor(padded_cond_seq=tok_prompt)
+        else:
+            B = num_samples
+            conditioning_tensor = None
+         # (B, N, D=512)
         
         audio_tokens = torch.full((B, self.nq, self.maxlen), fill_value=self.mask_id).to(device) # (B, Nq, T)
         if init_audio_tokens is not None:
@@ -307,17 +338,21 @@ class MAGNET(nn.Module):
     def _generate_phase(
         self,
         audio_tokens:Tensor, # (B, Nq, T)
-        conditioning_tensor:Tensor, # (B, N, D=512)
+        conditioning_tensor:tp.Optional[Tensor], # (B, N, D=512)
         phase:int,
         num_decoding_steps:int, # `s` in the paper
         device:torch.device,
         temp:float = 3.0,
         anneal_temp:bool = True,
+        cfg:bool = True,
+        cfg_coeff_init:int = 10,
+        cfg_coeff_final:int = 1,
         top_k:tp.Optional[int] = None,
         top_p:tp.Optional[float] = None,
         init_audio_len:int = 0,
         init_audio_tokens:tp.Optional[Tensor] = None
     ) -> Tensor:
+        if cfg: assert conditioning_tensor is not None, "conditioning_tensor should not be None"
         B, Nq, T = audio_tokens.shape
         gen_shape = (B, 1, T)
 
@@ -336,12 +371,13 @@ class MAGNET(nn.Module):
         num_init_audio_chunks = init_audio_len // self.spanlen
         # `span_scores`: high score if less probablity in the sampled tokens
         span_scores = torch.zeros(chunked_shape, dtype=torch.float32, device=device) # (B, 1, num_chunks)
-        # less score assigned to the initial audio chunks; so that they are not masked 
+        # less score assigned to the initial audio chunks; so that they are not masked
         # (only least probable spans are masked so that they are predicted by the model)
         span_scores[..., :num_init_audio_chunks] = DONT_REMASK_SCORE
         num_chunks_to_generate = num_chunks - num_init_audio_chunks
 
         for timestep in range(num_decoding_steps): # timestep is `i` from the paper
+            # `mask_p` decreases as `timestep` increases
             mask_p = math.cos((math.pi * timestep)/(2*num_decoding_steps))
             # `num_spanned_mask` decreases as `timestep` increases
             num_spanned_mask = max(1, int(num_chunks_to_generate * mask_p))
@@ -365,7 +401,18 @@ class MAGNET(nn.Module):
                 temp*(1-timestep/num_decoding_steps) if anneal_temp else temp, 0.01
             )
 
+            # conditioned logits if conditioning_tensor is not None else unconditioned logits
             logits:Tensor = self(audio_tokens, conditioning_tensor)[:, [phase], :, :] # (B, 1, T, cardinality) <= (B, Nq, T, cardinality)
+            if cfg:
+                # `cfg_coeff` = mask_p*10 + (1 - mask_p)*1 = 9*mask_p + 1
+                cfg_coeff = mask_p*cfg_coeff_init + (1 - mask_p)*cfg_coeff_final
+                # `cfg_coeff` decreases as `timestep` increases
+                # so more dependence on unconditioned logits as `timestep` increases
+                # see docs for more info
+                # logits = cond_logits * cfg_coeff + uncond_logits * (1 - cfg_coeff)
+                logits.mul_(cfg_coeff).add_(
+                    self(audio_tokens, None)[:, [phase], :, :], alpha=(1-cfg_coeff)
+                )
 
             tempr_logits = logits/_temp
             probs = tempr_logits.softmax(dim=-1) # (B, 1, T, cardinality)
@@ -378,7 +425,7 @@ class MAGNET(nn.Module):
             # place generated tokens in place of masked ids, else keep the original tokens
             # `mask`: True where top-k token; False when least probable token
             mask = (phase_gen_tokens == self.mask_id) # (B, 1, T)
-            #                  (B, 1, T)          # (B, 1, T)      # (B, T, 1)[..., 0]
+
             # phase_gen_tokens when condition is True else generated_tokens[..., 0]
             # generated_tokens[..., 0] when mask is True else phase_gen_tokens
             # print(mask.shape, phase_gen_tokens.shape, generated_tokens[..., None, 0].shape)
@@ -423,54 +470,56 @@ class MAGNET(nn.Module):
         return sampler(probs)
 
 
-def get_magnet_model():
+def get_magnet_model(compile:bool=True, monfig:monfig=monfig) -> MAGNET:
     # (B, Nq, T) # (B, N, cond_dim) # (T, T)
     model = Transformer(monfig)
     model = MAGNET(model, monfig) # build model, has lazy modules
     x = torch.randint(0, 1024, (2, 4, 750))
     conditioning_tensor = torch.randn((2, 10, 512))
     ___ = model(x, conditioning_tensor)
+    if compile:
+        model = torch.compile(model)
+    model.apply(model._init_weights)
     return model
 
-from icecream import ic
-ic.configureOutput(outputFunction=lambda x: print(x, end="\n\n"))
+"""
+class TransformerDecoder(nn.Module):
+    "
+    Args: config
+    Input:
+        seq:Tensor,               # (B, T, d_model)  # q
+        cond_tensor:Tensor,       # (B, N, cond_dim) # kv # output from t5-encoder model
+        cond_padding_mask:Tensor, # (B, N) # prompt padding mask
+        cross_att_mask:Tensor     # (T, N) # mask in cross attention due to padding in cond_tensor
+    "
+    def __init__(self, config:monfig):
+        super().__init__()
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer=nn.TransformerDecoderLayer(
+                d_model=config.d_model,
+                nhead=config.num_heads,
+                dim_feedforward=config.d_model*4,
+                dropout=config.dropout_rate,
+                batch_first=True,
+                norm_first=True
+            ),
+            num_layers=config.num_layers,
+            norm=nn.LayerNorm(config.d_model)
+        )
 
-# class TransformerDecoder(nn.Module):
-#     """```
-#     Args: config
-#     Input:
-#         seq:Tensor,               # (B, T, d_model)  # q
-#         cond_tensor:Tensor,       # (B, N, cond_dim) # kv # output from t5-encoder model
-#         cond_padding_mask:Tensor, # (B, N) # prompt padding mask
-#         cross_att_mask:Tensor     # (T, N) # mask in cross attention due to padding in cond_tensor
-#     ```"""
-#     def __init__(self, config:monfig):
-#         super().__init__()
-#         self.transformer_decoder = nn.TransformerDecoder(
-#             decoder_layer=nn.TransformerDecoderLayer(
-#                 d_model=config.d_model,
-#                 nhead=config.num_heads,
-#                 dim_feedforward=config.d_model*4,
-#                 dropout=config.dropout_rate,
-#                 batch_first=True,
-#                 norm_first=True
-#             ),
-#             num_layers=config.num_layers,
-#             norm=nn.LayerNorm(config.d_model)
-#         )
-
-#     def forward(
-#         self,
-#         seq:Tensor,
-#         cond_tensor:tp.Optional[Tensor], # Optionally None in case of cfg
-#         attn_mask:Tensor,
-#         cond_padding_mask:tp.Optional[Tensor] = None,
-#         cross_att_mask:tp.Optional[Tensor] = None
-#     ) -> Tensor:
-#         return self.transformer_decoder(
-#             tgt=seq, # sequence to decoder
-#             memory=cond_tensor, # sequence from last layer of encoder # cross att shape (T, N)
-#             tgt_mask=attn_mask,
-#             memory_key_padding_mask=cond_padding_mask, # ??? prompt padding mask, from T5 model
-#             memory_mask=cross_att_mask # ??? mask in cross attention due to padding in cond_tensor
-#         ) # (B, T, d_model)
+    def forward(
+        self,
+        seq:Tensor,
+        cond_tensor:tp.Optional[Tensor], # Optionally None in case of cfg
+        attn_mask:Tensor,
+        cond_padding_mask:tp.Optional[Tensor] = None,
+        cross_att_mask:tp.Optional[Tensor] = None
+    ) -> Tensor:
+        return self.transformer_decoder(
+            tgt=seq, # sequence to decoder
+            memory=cond_tensor, # sequence from last layer of encoder # cross att shape (T, N)
+            tgt_mask=attn_mask,
+            memory_key_padding_mask=cond_padding_mask, # ??? prompt padding mask, from T5 model
+            memory_mask=cross_att_mask # ??? mask in cross attention due to padding in cond_tensor
+        ) # (B, T, d_model)
+"""

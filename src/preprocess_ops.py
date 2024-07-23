@@ -16,12 +16,13 @@ T5_MODEL_PATH = "google-t5/t5-small"
 
 class PreProOps:
     def __init__(
-        self, 
+        self,
         max_sec:float|int,
         autocast:torch.autocast,
         print_info:bool=False,
-        compile:bool=True, 
-        device:str="cuda"
+        compile:bool=True,
+        device:str="cuda",
+        dtype:torch.dtype=torch.float32
     ):
         self.device = torch.device(device)
         self.autocast = autocast
@@ -32,21 +33,28 @@ class PreProOps:
         self.SRATE = self.encodec_model.sample_rate
         self.WAVLEN = int(self.SRATE*max_sec)
 
-        self.encodec_model.to(self.device)
+        self.encodec_model.to(self.device, dtype=dtype)
         if compile:
-            if print_info: print("compiling encodec model...")
+            if print_info: print("compiling encodec model...", end=" => ")
             self.encodec_model.compile()
-            if print_info: print("compiled encodec model.")
+            if print_info: print("Done.")
         self.encodec_model.eval()
         
         self.cond_tokenizer = AutoTokenizer.from_pretrained(T5_MODEL_PATH)
         self.cond_model = T5EncoderModel.from_pretrained(T5_MODEL_PATH)
-        self.cond_model.to(self.device)
+        self.cond_model.to(self.device, dtype=dtype)
         if compile:
-            if print_info: print("compiling T5 model...")
+            if print_info: print("compiling T5 model...", end=" => ")
             self.cond_model.compile()
-            if print_info: print("compiled T5 model.")
+            if print_info: print("Done")
         self.cond_model.eval()
+
+        print("\nNumber of Parameters in Encodec Model:", 
+            sum(p.numel() for p in self.encodec_model.parameters() if p.requires_grad)/1e6, "Million Parameters\n"
+        )
+        print(f"\nNumber of Parameters in T5 Model ({T5_MODEL_PATH}):", 
+            sum(p.numel() for p in self.cond_model.parameters() if p.requires_grad)/1e6, "Million Parameters\n"
+        )
         
     def preprocess_wavpath(self, wavpath:str, get_qcodings:bool) -> torch.Tensor:
         wav, sr = torchaudio.load(wavpath)
