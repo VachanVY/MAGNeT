@@ -277,12 +277,10 @@ class MAGNET(nn.Module):
     def mask_id(self): return self.cardinality
 
     @staticmethod
-    def cfg(cond_str:list[str], randf:float, cfg_dropout:float, preprocess_ops:tp.Any) -> tp.Optional[Tensor]:
+    def cfg(cond_tensor:Tensor, randf:float, cfg_dropout:float) -> tp.Optional[Tensor]:
         """to disable cfg, set `cfg_dropout` to 0.0, for full cfg, set `cfg_dropout` to 1.0"""
         if randf < cfg_dropout:
             return None
-        padded_cond_seq = preprocess_ops.tokenize(cond_str)
-        cond_tensor = preprocess_ops.get_conditioned_tensor(padded_cond_seq)
         return cond_tensor
        
     @torch.inference_mode()

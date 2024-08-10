@@ -7,6 +7,7 @@ import pickle
 from itertools import islice
 import json
 
+import torch
 
 #----------------------------------------------------------------------------------------------#
 MAX_SEC = 10
@@ -25,9 +26,9 @@ AUDIO_TXT_PATH = os.path.join(DATA_DIR, "audiopath_txt.pkl")
 #----------------------------------------------------------------------------------------------#
 
 
-def shuffle_preserve_order(a, b):
+def shuffle_preserve_order(a, b, randgen:r.Random):
     combined = list(zip(a, b))
-    r.shuffle(combined)
+    randgen.shuffle(combined)
     
     a, b = zip(*combined)
     return a, b
@@ -47,18 +48,18 @@ def get_shape(lst):
     return shape
 
 
-def split_ds(x, y, split_float:float):
-    # assert len(x) == len(y), f"len(x): {len(x)} and len(y): {len(y)}"
+def split_ds(x, y, split_float:float=0.9):
     train_len = int(split_float*len(x))
 
-    x_train, y_train = x[:train_len], y[:train_len]
-    x_val, y_val = x[train_len:], y[train_len:]
-    
-    assert get_shape(x_train) == get_shape(y_train)
-    assert get_shape(x_val) == get_shape(y_val)
+    x_train, x_val = x[:train_len], x[train_len:]
+    if y is not  None:
+        y_train, y_val =  y[:train_len], y[train_len:]
+        
+        assert get_shape(x_train) == get_shape(y_train)
+        assert get_shape(x_val) == get_shape(y_val)
     return {
-        "train": (x_train, y_train),
-        "val": (x_val, y_val)
+        "train": (x_train, y_train) if y is not None else x_train,
+        "val": (x_val, y_val) if y is not None else x_val
     }
 
 
@@ -153,22 +154,107 @@ def ioPathTextDs(
                 obj=[paths, texts], file=file,
                 protocol=pickle.HIGHEST_PROTOCOL
             )
+        print("Dataset is preprocessed.")
+        return (paths, texts) if return_ds else None
     else:
         # load dataset
         with open(save_path, "rb") as file:
             paths, texts = pickle.load(file)
         if len(paths[0]) != batch_size:
             print(f"Making dataset for batch_size: {batch_size} instead of `batch_size` in saved dataset.")
-            paths, texts = ioPathTextDs(
-                AUDIO_TXT_PATH, 
+            return ioPathTextDs(
+                AUDIO_TXT_PATH,
                 batch_size=batch_size, 
                 split_float=split_float,
                 return_ds=True,
                 force_redo=True
+            ) if return_ds else None
+        return (paths, texts) if return_ds else None
+    
+
+def precondition(save_path:str, force_redo:bool=False, device_type="cuda"):
+    from preprocess_ops import PreProOps, get_qcodings
+    from tqdm import tqdm
+    import torch
+
+    with open(save_path, "rb") as file:
+        paths, texts = pickle.load(file) # (len//batch_size, batch_size)
+
+    batch_size = len(paths[0])
+    PATH = os.path.join(DATA_DIR, f"precondition_batch_size_{batch_size}")
+    if not os.path.exists(PATH) or len(os.listdir(PATH)) == 0 or force_redo:
+        preprocess_ops = PreProOps(
+            max_sec=MAX_SEC,
+            device="cuda",
+            autocast=torch.autocast(device_type=device_type, dtype=torch.float16),
+            compile=True,
+            print_info=False,
+        )
+        os.makedirs(PATH, exist_ok=True)
+        for i, (batched_wavpath, batched_text_str) in tqdm(enumerate(zip(paths, texts))):
+            qcodings = preprocess_ops.get_qcodings(
+                batched_wavpath,
+                preprocess_ops=preprocess_ops,
+                audio_pad_id=preprocess_ops.audio_pad_id,
+                qcoding_len=QCODING_LEN
             )
-        print("Dataset is preprocessed.")
-    if return_ds:
-        return split_ds(paths, texts, split_float=split_float)
+            cond_tensor = preprocess_ops.get_cond_tensor(batched_text_str)
+            torch.save(obj=(qcodings, cond_tensor), f=os.path.join(PATH, f"musicbench{i}.pt"))
+    return PATH
+
+
+class PreProDataset:
+    def __init__(
+        self, *,
+        split:str, # 'train' or 'val'
+        audio_pad_id:int,
+        qcoding_len:int,
+        device:str,
+        randgen:r.Random,
+        pre_computed_tensors_dirpath:tp.Optional[str]=None,
+        online:bool=False,
+        # Optionally None if online is False
+        wav_paths:tp.Optional[list[str]]=None,
+        texts:tp.Optional[list[str]]=None,
+        preprocess_ops:tp.Optional[tp.Any]=None
+    ):
+        assert split in ["train", "val"]
+        self.online = online
+
+        if self.online:
+            assert all([wav_paths is not None, texts is not None, preprocess_ops is not None])
+            self.wav_paths = wav_paths # (N//B, B)
+            self.texts = texts # (N//B, B)
+            self.preprocess_ops = preprocess_ops
+
+            self.wav_paths, self.texts = split_ds(self.wav_paths, self.texts, split_float=0.9)[split]
+        else:
+            assert pre_computed_tensors_dirpath is not None
+            shard_filenames = sorted(glob.glob(os.path.join(pre_computed_tensors_dirpath, "musicbench*.pt")))
+            assert len(shard_filenames) > 0
+            self.shard_filenames = split_ds(shard_filenames, None, split_float=0.9)[split]
+
+        self.audio_pad_id = audio_pad_id
+        self.qcoding_len = qcoding_len
+        self.randgen = randgen
+        self.device = torch.device(device)
+    
+    def iter_batches(self):
+        while True:
+            if self.online:
+                self.wav_paths, self.texts = shuffle_preserve_order(self.wav_paths, self.texts, randgen=self.randgen)
+                for batched_wavpath, batched_text_str in zip(self.wav_paths, self.texts):
+                    qcodings = self.preprocess_ops.get_qcodings(
+                        batched_wavpath, qcoding_len=self.qcoding_len
+                    )
+                    cond_tensor = self.preprocess_ops.get_cond_tensor(batched_text_str)
+                    yield qcodings, cond_tensor
+            else:
+                self.randgen.shuffle(self.shard_filenames)
+                for shard_filename in self.shard_filenames:
+                    qcodings, cond_tensor = torch.load(shard_filename)
+                    yield qcodings, cond_tensor
+
 
 if __name__ == "__main__":
     import argparse
@@ -176,6 +262,7 @@ if __name__ == "__main__":
     parser.add_argument('--download', default=False, type=bool)
     parser.add_argument('--preprocess', default=False, type=bool)
     parser.add_argument('--batch_size', default=32, type=int)
+    parser.add_argument('--cond_tensors', default=True, type=bool)
     args = parser.parse_args()
 
     if args.download:
@@ -184,3 +271,6 @@ if __name__ == "__main__":
     if args.preprocess:
         print("Request: --preprocess")
         ioPathTextDs(AUDIO_TXT_PATH, batch_size=args.batch_size, split_float=0.9)
+        if args.cond_tensors:
+            print("Request: --cond_tensors")
+            print("Saved in tensors in directory", precondition(AUDIO_TXT_PATH))

@@ -5,3 +5,5 @@
 *.pkl
 __pycache__/
 magnet_init_play.ipynb
+*.zip
+*.pt

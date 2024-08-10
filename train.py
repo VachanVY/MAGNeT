@@ -13,14 +13,16 @@ from tqdm import trange
 import torch; torch.cuda.empty_cache()
 from torch import nn, Tensor
 from torch.nn import functional as F
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # use this if getting Out Of Memory Error
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # uncomment this if getting Out Of Memory Error
 
 from src.music_bench import (
-    shuffle_preserve_order,
+    split_ds,
     ioPathTextDs,
     AUDIO_TXT_PATH,
+    DATA_DIR,
     QCODING_LEN,
-    MAX_SEC
+    MAX_SEC,
+    PreProDataset
 )
 from src.preprocess_ops import PreProOps
 from src.model import (
@@ -30,6 +32,7 @@ from src.model import (
 )
 from src.utils.lr_scheduler import CosineDecayWithWarmup
 
+ONLINE = True # True if conditioned text and qcodings are computed on the go else False
 #---------------------------------------------------------------------------------------------------#
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -91,67 +94,18 @@ class tonfig:
 
     # dtype args # 'encodec model has LSTMs which doesn't work with bfloat16'
     dtype:str = "float16" # float16
+
+    PRECOMPUTED_TENSORS_DIRPATH:str = os.path.join(DATA_DIR, f"precondition_batch_size_{batch_size}")
+    assert os.path.exists(PRECOMPUTED_TENSORS_DIRPATH)
 #---------------------------------------------------------------------------------------------------#
 RANDGEN:r.Random = r.Random(tonfig.seed)
 GENRERATOR:torch.Generator = torch.Generator(device=tonfig.device).manual_seed(tonfig.seed+1)
 #---------------------------------------------------------------------------------------------------#
 
-class PreProDataset:
-    def __init__(
-        self, 
-        wav_paths:list[str], 
-        texts:list[str], 
-        audio_pad_id:int, 
-        qcoding_len:int,
-        preprocess_ops:PreProOps,
-        device:str
-    ):
-        self.wav_paths = wav_paths # (N//B, B)
-        self.texts = texts # (N//B, B)
-        self.audio_pad_id = audio_pad_id
-        self.qcoding_len = qcoding_len
-        self.device = torch.device(device)
-        self.preprocess_ops = preprocess_ops
-    
-    def preprocess(self, wavpaths:str, text_str:str):
-        # pads to maxlen in batch
-        quantized_codings = list(map(
-            lambda x: self.preprocess_ops.preprocess_wavpath(x, get_qcodings=True), 
-            wavpaths)
-        )# [[T=..., Nq=4], ...]
-
-        quantized_codings = nn.utils.rnn.pad_sequence(
-            sequences=quantized_codings,
-            batch_first=True,
-            padding_value=self.audio_pad_id
-        ).movedim(1, -1) # (B, Nq=4, T<=750) <= (B, T<=750, Nq=4)
-        
-        # if maxlen<WAVLEN pad to WAVLEN
-        if quantized_codings.shape[-1] != self.qcoding_len: # if not 750
-            quantized_codings = F.pad(
-                quantized_codings, (0, self.qcoding_len - quantized_codings.shape[-1]), value=self.audio_pad_id
-            ) # (B, Nq=4, 750)
-        pad_mask = quantized_codings != self.audio_pad_id  # (B, T) # False value contains the padded tokens # True value is to be taken
-        # Example = [[0,    1,   2, 1024, 1024],
-        #            [1023, 2, 100,    4, 1024]]
-        # example != 1024 =>
-        # [[True, True, True, False, False],
-        #  [True, True, True, True, False]]
-        
-        return {"qcode": quantized_codings, "mask": pad_mask}, text_str
-    
-    def iter_batches(self):
-        while True:
-            self.wav_paths, self.texts = shuffle_preserve_order(self.wav_paths, self.texts)
-            for batched_wavpath, batched_text_str in zip(self.wav_paths, self.texts):
-                wavs, text_str = self.preprocess(batched_wavpath, batched_text_str)
-                yield wavs, text_str
-
 class MagnetTrainer:
     def __init__(
         self, 
         magnet_model:MAGNET, 
-        preprocess_ops:PreProOps, 
         config:tonfig,
     ):
         self.magnet_model = magnet_model
@@ -167,7 +121,6 @@ class MagnetTrainer:
             self._get_number_of_spans_to_mask(T=config.seqlen, L=config.spanlen),
             device=self.device
         ) # (100,)
-        self.preprocess_ops = preprocess_ops
 
     def _get_number_of_spans_to_mask(self, T:int, L:int):
         """
@@ -236,7 +189,7 @@ class MagnetTrainer:
     def mini_train_step( # mini train step if gradient accumulation is used
         self,
         audio_input:dict[str, Tensor],
-        cond_str:list[str],
+        cond_tensor:Tensor,
     ):
         """```
         audio_input: {"qcode": audio_tokens,   # tensor of shape (B, Nq, T)
@@ -254,10 +207,9 @@ class MagnetTrainer:
 
         # conditioning tensor
         cond_tensor = self.magnet_model.cfg(
-            cond_str=cond_str,
+            cond_tensor=cond_tensor,
             randf=self.randgen.random(),
             cfg_dropout=self.cfg_dropout,
-            preprocess_ops=self.preprocess_ops,
         )
 
         # A random phase: for masking a random codebook
@@ -340,6 +292,7 @@ def update_ema(ema_model:MAGNET, model:MAGNET, decay:float):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
+        # ema = decay*ema + (1-decay)*param
         ema_params[name].mul_(decay).add_(param.data, alpha=1-decay)
 
 
@@ -354,11 +307,11 @@ def evaluate():
         metrics = torch.empty_like(losses, device=tonfig.device)
 
         for eval_step in trange(tonfig.eval_steps):
-            audio_input, cond_text = next(eval_iterator)
+            audio_input, cond_tensor = next(eval_iterator)
             with ctx:
                 loss, acc = magnet_trainer.mini_train_step(
                     audio_input=audio_input,
-                    cond_str=cond_text
+                    cond_tensor=cond_tensor
                 )
             losses[eval_step], metrics[eval_step] = loss, acc[0]
         mean_losses.append(losses.mean())
@@ -370,7 +323,7 @@ def evaluate():
 
 def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
     global best_val_loss, start_iter
-    audio_input, cond_text = next(train_iterator)
+    audio_input, cond_tensor = next(train_iterator)
 
     print("Training about to start...")
     t0 = time.time()
@@ -415,13 +368,13 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
         for mini_step in range(tonfig.num_grad_accumalation_steps):
             with ctx:
                 loss, accuracy = magnet_trainer.mini_train_step(
-                    audio_input=audio_input, cond_str=cond_text
+                    audio_input=audio_input, cond_tensor=cond_tensor
                 )
                 if loss.isnan() or loss.isinf():
                     raise RuntimeError(f"Step: {step}\nMini-Step: {mini_step}\nLoss: {loss}\nDIVERGING :(")
                 loss /= tonfig.num_grad_accumalation_steps
                 # async prefetch immediately
-                audio_input, cond_text = next(train_iterator)
+                audio_input, cond_tensor = audio_input, cond_tensor
 
             # keeps on scaling and adding gradients when calling backward
             scaler.scale(loss).backward()
@@ -476,43 +429,53 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
 
 if __name__ == "__main__":
     # dataset
-    # just kept this as float16 to get rid of out of memory error, but norm explodes and loss becomes nan, so keep it float32. dumb...
-    MODEL_DTYPE = torch.float32
     assert "cuda" in tonfig.device, "Only cuda is supported for training."
-    assert MODEL_DTYPE == torch.float32 # not to be confused with autocast dtype
-    
-    dataset = ioPathTextDs(
-        save_path=AUDIO_TXT_PATH,
-        batch_size=tonfig.batch_size,
-        split_float=0.9,
-        return_ds=True
-    )
-    X_train, y_train = dataset["train"]
-    X_val, y_val = dataset["val"]
-    del dataset
 
     # for float16 or bfloat16 training
     ctx = torch.autocast(
         device_type=tonfig.device_type,
-        dtype=MODEL_DTYPE
-    )
-
-    preprocess_ops = PreProOps(
-        max_sec=MAX_SEC, 
-        device=tonfig.device,
-        autocast=ctx,
-        compile=True,
-        print_info=False,
-        dtype=MODEL_DTYPE
+        dtype={"float16": torch.float16, "bfloat16": torch.bfloat16}[tonfig.dtype]
     )
     
-    iterator = lambda X, y: iter(
+    X_train, y_train, X_val, y_val = None, None, None, None
+    preprocess_ops = None
+    if ONLINE:
+        paths, texts = ioPathTextDs(
+            save_path=AUDIO_TXT_PATH,
+            batch_size=tonfig.batch_size,
+            split_float=0.9,
+            return_ds=True
+        )
+        dataset = split_ds(paths, texts, 0.9)
+        X_train, y_train = dataset["train"]
+        X_val, y_val = dataset["val"]
+        del dataset
+
+        preprocess_ops = PreProOps(
+            max_sec=MAX_SEC,
+            device=tonfig.device,
+            autocast=ctx,
+            compile=True,
+            print_info=False,
+        )
+    
+    iterator = lambda X, y, split: iter(
         PreProDataset(
-            X, y, audio_pad_id=tonfig.mask_id, 
-            qcoding_len=tonfig.seqlen, preprocess_ops=preprocess_ops, device=tonfig.device
+            split=split,
+            randgen=RANDGEN,
+            audio_pad_id=tonfig.mask_id,
+            qcoding_len=tonfig.seqlen,
+            device=tonfig.device,
+            pre_computed_tensors_dirpath=tonfig.PRECOMPUTED_TENSORS_DIRPATH,
+            online=ONLINE,
+            wav_paths=X, texts=y,
+            preprocess_ops=preprocess_ops,
         ).iter_batches()
     )
-    train_iterator, val_iterator = iterator(X_train, y_train), iterator(X_val, y_val)
+    train_iterator, val_iterator = (
+        iterator(X_train, y_train, "train"), 
+        iterator(X_val, y_val, "val")
+    )
     # lr scheduler
     get_lr = CosineDecayWithWarmup(
         warmup_steps=tonfig.warmup_steps,
@@ -559,8 +522,8 @@ if __name__ == "__main__":
         best_val_loss = checkpoint["best_val_loss"]
         losses, accuracies, mask_accuracies = checkpoint["losses"], checkpoint["accuracies"], checkpoint["mask_accuracies"]
 
-    magnet_model.to(tonfig.device, dtype=MODEL_DTYPE); magnet_model.train()
-    ema.to(tonfig.device, dtype=MODEL_DTYPE); ema.eval() # use ema for sampling
+    magnet_model.to(tonfig.device); magnet_model.train()
+    ema.to(tonfig.device); ema.eval() # use ema for sampling
     ema.requires_grad_(False)
     update_ema(ema, magnet_model, 0.0) # copy the weights
     print("\nNumber of Parameters in MAGNET Model:", 
@@ -579,18 +542,18 @@ if __name__ == "__main__":
         optimizer.load_state_dict(checkpoint["optimizer"])
     checkpoint = None # free memory
 
-    magnet_trainer = MagnetTrainer(magnet_model=magnet_model, preprocess_ops=preprocess_ops, config=tonfig)
+    magnet_trainer = MagnetTrainer(magnet_model=magnet_model, config=tonfig)
 
     losses, accuracies, mask_accuracies = train(losses, accuracies, mask_accuracies)
     plt.title("Loss and Accuracy")
-    plt.plot(losses, legend="Loss")
-    plt.plot(accuracies, legend="Accuracy")
-    plt.plot(mask_accuracies, legend="Masked Accuracy")
-    plt.xticks(range(0, tonfig.num_steps, tonfig.num_steps//33.33333), rotation=90)
+    plt.plot(losses, label="Loss")
+    plt.plot(accuracies, label="Accuracy")
+    plt.plot(mask_accuracies, label="Masked Accuracy")
+    plt.xticks(range(0, tonfig.num_steps, int(tonfig.num_steps//33.33333)), rotation=90)
     plt.grid(True)
     plt.ylabel("Loss/Accuracy")
     plt.xlabel("Steps")
     plt.legend()
-    plt.show()
     plt.savefig("images/loss_accuracy.png")
+    plt.show()
     print("Training done.")
