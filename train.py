@@ -13,7 +13,7 @@ from tqdm import trange
 import torch; torch.cuda.empty_cache()
 from torch import nn, Tensor
 from torch.nn import functional as F
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # use this if getting Out Of Memory Error
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # use this if getting Out Of Memory Error
 
 from src.music_bench import (
     shuffle_preserve_order,
@@ -320,7 +320,7 @@ class MagnetTrainer:
         if loss_mask is not None:
             loss_mask = loss_mask.flatten(1)
             batch_mask_acc = list(map(MagnetTrainer._masked_accuracy, y_true, y_pred, loss_mask))
-            return acc, sum(batch_mask_acc)/len(batch_mask_acc)
+            return acc, sum(batch_mask_acc)/len(batch_mask_acc) # sometimes gets nans for masked accuracy. Investigate...
         return acc
     
     def _masked_accuracy(
@@ -476,10 +476,7 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
 
 if __name__ == "__main__":
     # dataset
-    # just kept this as float16 to get rid of out of memory error, but norm explodes and loss becomes nan, so keep it float32. dumb...
-    MODEL_DTYPE = torch.float32
     assert "cuda" in tonfig.device, "Only cuda is supported for training."
-    assert MODEL_DTYPE == torch.float32 # not to be confused with autocast dtype
     
     dataset = ioPathTextDs(
         save_path=AUDIO_TXT_PATH,
@@ -494,7 +491,8 @@ if __name__ == "__main__":
     # for float16 or bfloat16 training
     ctx = torch.autocast(
         device_type=tonfig.device_type,
-        dtype=MODEL_DTYPE
+        dtype={"bfloat16": torch.bfloat16,
+            "float16" : torch.float16}[tonfig.dtype]
     )
 
     preprocess_ops = PreProOps(
@@ -503,7 +501,6 @@ if __name__ == "__main__":
         autocast=ctx,
         compile=True,
         print_info=False,
-        dtype=MODEL_DTYPE
     )
     
     iterator = lambda X, y: iter(
@@ -559,15 +556,15 @@ if __name__ == "__main__":
         best_val_loss = checkpoint["best_val_loss"]
         losses, accuracies, mask_accuracies = checkpoint["losses"], checkpoint["accuracies"], checkpoint["mask_accuracies"]
 
-    magnet_model.to(tonfig.device, dtype=MODEL_DTYPE); magnet_model.train()
-    ema.to(tonfig.device, dtype=MODEL_DTYPE); ema.eval() # use ema for sampling
+    magnet_model.to(tonfig.device, dtype=torch.float32); magnet_model.train()
+    ema.to(tonfig.device, dtype=torch.float32); ema.eval() # use ema for sampling
     ema.requires_grad_(False)
     update_ema(ema, magnet_model, 0.0) # copy the weights
     print("\nNumber of Parameters in MAGNET Model:", 
             sum(p.numel() for p in magnet_model.parameters() if p.requires_grad)/1e6, "Million Parameters\n"
         )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(tonfig.device=="float16"))
+    scaler = torch.cuda.amp.GradScaler(enabled=(tonfig.dtype=="float16"))
     optimizer = magnet_model.configure_optimizers(
         weight_decay=tonfig.weight_decay,
         learning_rate=tonfig.max_learning_rate,

@@ -22,7 +22,6 @@ class PreProOps:
         print_info:bool=False,
         compile:bool=True,
         device:str="cuda",
-        dtype:torch.dtype=torch.float32
     ):
         self.device = torch.device(device)
         self.autocast = autocast
@@ -33,7 +32,7 @@ class PreProOps:
         self.SRATE = self.encodec_model.sample_rate
         self.WAVLEN = int(self.SRATE*max_sec)
 
-        self.encodec_model.to(self.device, dtype=dtype)
+        self.encodec_model.to(self.device, dtype=torch.float32)
         if compile:
             if print_info: print("compiling encodec model...", end=" => ")
             self.encodec_model.compile()
@@ -42,7 +41,7 @@ class PreProOps:
         
         self.cond_tokenizer = AutoTokenizer.from_pretrained(T5_MODEL_PATH)
         self.cond_model = T5EncoderModel.from_pretrained(T5_MODEL_PATH)
-        self.cond_model.to(self.device, dtype=dtype)
+        self.cond_model.to(self.device, dtype=torch.float32)
         if compile:
             if print_info: print("compiling T5 model...", end=" => ")
             self.cond_model.compile()

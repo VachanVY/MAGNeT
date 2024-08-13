@@ -3,5 +3,8 @@
 *.tar.gz
 *.wav
 *.pkl
+*.zip
+data
+ckpt.pt
 __pycache__/
 magnet_init_play.ipynb
