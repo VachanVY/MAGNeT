@@ -10,7 +10,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from tqdm import trange
 
-import torch; torch.cuda.empty_cache()
+import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256" # uncomment this if getting Out Of Memory Error
@@ -32,7 +32,7 @@ from src.model import (
 )
 from src.utils.lr_scheduler import CosineDecayWithWarmup
 
-ONLINE = True # True if conditioned text and qcodings are computed on the go else False
+ONLINE = False # True if conditioned text and qcodings are computed on the go else False
 #---------------------------------------------------------------------------------------------------#
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -370,8 +370,8 @@ def train(losses:list=[], accuracies:list=[], mask_acc:list=[]):
                 loss, accuracy = magnet_trainer.mini_train_step(
                     audio_input=audio_input, cond_tensor=cond_tensor
                 )
-                if loss.isnan() or loss.isinf():
-                    raise RuntimeError(f"Step: {step}\nMini-Step: {mini_step}\nLoss: {loss}\nDIVERGING :(")
+                # if loss.isnan() or loss.isinf():
+                #     raise RuntimeError(f"Step: {step}\nMini-Step: {mini_step}\nLoss: {loss}\nDIVERGING :(")
                 loss /= tonfig.num_grad_accumalation_steps
                 # async prefetch immediately
                 audio_input, cond_tensor = audio_input, cond_tensor
@@ -530,7 +530,7 @@ if __name__ == "__main__":
             sum(p.numel() for p in magnet_model.parameters() if p.requires_grad)/1e6, "Million Parameters\n"
         )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(tonfig.device=="float16"))
+    scaler = torch.cuda.amp.GradScaler(enabled=True if tonfig.dtype == "float16" else False)
     optimizer = magnet_model.configure_optimizers(
         weight_decay=tonfig.weight_decay,
         learning_rate=tonfig.max_learning_rate,
